@@ -732,11 +732,59 @@ function initialsFrom(name,email){
   if(n){ const p=n.split(/\s+/); return ((p[0][0]||'')+(p[1]?p[1][0]:'')).toUpperCase(); }
   return (email||'?').slice(0,2).toUpperCase();
 }
+/* Identity of the accounts that ship with the ledger. Used to heal records
+   saved by earlier versions that had no email field, so a known person always
+   lands on their real role instead of becoming a new pending account. */
+const SEED_IDENTITY={
+  'u-janine':{email:'janinet@partnersmortgage.com', name:'Janine Thomas', role:'finance', branches:['*'], title:'Finance Operations', init:'JT', color:'#00818D'},
+  'u-jason' :{email:'jasonm@partnersmortgage.com',  name:'Jason Malmstrom', role:'manager', branches:['malmstrom'], title:'Branch Manager \u00b7 Malmstrom Group', init:'JM', color:'#8A7E78'},
+  'u-leif'  :{email:'lboyd@partnersmortgage.com',   name:'Leif Boyd', role:'admin', branches:['*'], title:'Administrator \u00b7 Senior Approver', init:'LB', color:'#1F2A2D'}
+};
+function migrateUsers(){
+  let changed=false, notes=[];
+  /* 1. backfill fields missing from records written by earlier versions */
+  S.users.forEach(u=>{
+    const seed=SEED_IDENTITY[u.id];
+    if(seed){
+      if(!u.email){ u.email=seed.email; changed=true; notes.push('email restored for '+seed.name); }
+      if(!u.role||u.role!==seed.role){ u.role=seed.role; changed=true; }
+      if(!u.branches||!u.branches.length){ u.branches=seed.branches.slice(); changed=true; }
+      if(!u.init) u.init=seed.init;
+      if(!u.color) u.color=seed.color;
+    }
+    if(u.pending===undefined){ u.pending=!(u.branches&&u.branches.length); changed=true; }
+    if(u.uid===undefined){ u.uid=null; changed=true; }
+  });
+  /* 2. collapse duplicate accounts that share an email (created when matching failed) */
+  const byEmail={};
+  S.users.forEach(u=>{ const e=(u.email||'').toLowerCase(); if(!e) return; (byEmail[e]=byEmail[e]||[]).push(u); });
+  Object.entries(byEmail).forEach(([e,list])=>{
+    if(list.length<2) return;
+    const rank=u=>(SEED_IDENTITY[u.id]?4:0)+(u.pending?0:2)+((u.branches&&u.branches.length)?1:0);
+    list.sort((a,b)=>rank(b)-rank(a));
+    const keep=list[0];
+    list.slice(1).forEach(dup=>{
+      if(dup.uid&&!keep.uid) keep.uid=dup.uid;
+      S.branches.forEach(b=>{ if(b.manager===dup.id) b.manager=keep.id; });
+      S.transactions.forEach(t=>{ if(t.createdBy===dup.id) t.createdBy=keep.id; });
+      S.requests.forEach(r=>{ if(r.createdBy===dup.id) r.createdBy=keep.id; });
+      S.users=S.users.filter(x=>x.id!==dup.id);
+      changed=true; notes.push('merged duplicate account for '+e);
+    });
+  });
+  if(changed){ logAudit('access','Account records healed \u00b7 '+(notes.join('; ')||'schema updated'),null); save(); }
+  return changed;
+}
 function resolveAppUser(){
+  migrateUsers();
   const email=(authUser.email||'').toLowerCase();
   let u=S.users.find(x=>(x.email||'').toLowerCase()===email);
   if(u){
-    if(u.uid!==authUser.uid || u.pending===undefined){ u.uid=authUser.uid; save(); }
+    const wasPending=u.pending;
+    u.uid=authUser.uid;
+    if(u.branches&&u.branches.length) u.pending=false;   /* claimed a pre-assigned seat */
+    if(wasPending&&!u.pending) logAudit('access',u.name+' registered and claimed assigned access',null);
+    save();
     me=u;
   }else{
     const name=pendingSignupName||authUser.email;
@@ -891,12 +939,33 @@ function renderUnassigned(){
     <div style="font-family:'Lora',serif;font-size:1.4rem;color:var(--teal);margin-bottom:10px">You are all set, ${esc((me.name||'').split(' ')[0])}.</div>
     <p class="muted" style="font-size:.95rem;line-height:1.6">Your account is created and signed in. You have not been assigned to a branch yet, so there is nothing to show here right now.</p>
     <p class="muted" style="font-size:.95rem;line-height:1.6;margin-top:10px">Ask Janine to assign your branch and role. As soon as she does, your dashboard, ledger, and reports appear here automatically. No need to sign in again; this page will update on its own.</p>
-    <div style="margin-top:18px;display:flex;gap:10px;justify-content:center">
+    <div style="margin-top:18px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+      ${Object.values(SEED_IDENTITY).some(x=>x.email===(me.email||'').toLowerCase())?'<button class="btn btn-primary btn-sm" onclick="claimSeedAccess()">Restore my access</button>':''}
       <button class="btn btn-ghost btn-sm" onclick="sendFeedback()">Contact Leif</button>
       <button class="btn btn-quiet btn-sm" onclick="signOut()">Sign out</button>
     </div>
     <div class="muted" style="font-size:.78rem;margin-top:14px">Signed in as ${esc(me.email||'')}</div>
   </div>`;
+}
+function claimSeedAccess(){
+  const email=(me.email||'').toLowerCase();
+  const entry=Object.entries(SEED_IDENTITY).find(([,v])=>v.email===email);
+  if(!entry){ toast('That account is not one of the built-in roles. Ask Janine to assign your branch.','warn'); return; }
+  const [sid,seed]=entry;
+  const dupId=me.id;
+  let target=S.users.find(u=>u.id===sid);
+  if(!target){ target={id:sid,...seed,branches:seed.branches.slice(),pending:false,uid:null}; S.users.push(target); }
+  target.email=seed.email; target.name=seed.name; target.role=seed.role;
+  target.branches=seed.branches.slice(); target.title=seed.title; target.pending=false; target.uid=authUser?authUser.uid:target.uid;
+  if(dupId!==sid){
+    S.branches.forEach(b=>{ if(b.manager===dupId) b.manager=sid; });
+    S.users=S.users.filter(u=>u.id!==dupId);
+  }
+  me=target;
+  curBranch=(me.branches[0]==='*')?((S.branches[0]||{}).id):me.branches[0];
+  logAudit('access','Built-in access restored \u00b7 '+seed.name+' ('+seed.email+')',null);
+  save(); curView='dashboard'; renderAll();
+  toast('Welcome back, '+seed.name.split(' ')[0]+'. Full access restored.','ok');
 }
 function renderNav(){
   const openCount=S.requests.filter(r=>r.branch===myBranch()&&OPEN_REQ.includes(r.status)).length;
@@ -929,7 +998,8 @@ function renderAll(){
   const bEl=document.getElementById('tbBranch');
   const curBr=S.branches.find(x=>x.id===myBranch())||S.branches[0];
   if(me.branches[0]==='*'){
-    bEl.innerHTML='<select id="branchSwitch" class="branch-switch">'+S.branches.map(x=>`<option value="${x.id}" ${x.id===myBranch()?'selected':''}>${esc(x.name)} \u00b7 ${esc(x.city)}</option>`).join('')+'</select>';
+    bEl.innerHTML='<select id="branchSwitch" class="branch-switch">'+S.branches.map(x=>`<option value="${x.id}" ${x.id===myBranch()?'selected':''}>${esc(x.name)} \u00b7 ${esc(x.city)}</option>`).join('')+'</select>'
+      +' <button class="btn btn-quiet btn-sm" style="margin-left:6px" onclick="go(\'admin\')" title="Add a branch or manage access">+ Add branch</button>';
   }else{
     bEl.textContent=curBr.name+' \u00b7 '+curBr.city;
   }
@@ -2320,6 +2390,27 @@ function renderAdmin(){
   const cur=policyFor(today());
   document.getElementById('v-admin').innerHTML=`
   <div class="grid-2col" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px">
+    ${me.role!=='manager'?`
+    <div class="card" style="grid-column:1/-1;border-left:4px solid var(--teal)">
+      <h3 style="margin:0 0 6px">Add a branch</h3>
+      <p class="muted" style="margin:0 0 12px;font-size:.86rem">Creates the branch, its manager sign-in, an opening balance entry, and an optional monthly rent rule, all in one step. The new branch appears in the top bar dropdown immediately.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px">
+        <div class="fld"><label>Branch name</label><input id="nb-name" placeholder="e.g. Garcia Group"></div>
+        <div class="fld"><label>City, state</label><input id="nb-city" placeholder="e.g. Sacramento, CA"></div>
+        <div class="fld"><label>Manager full name</label><input id="nb-mgr" placeholder="e.g. Rob Garcia"></div>
+        <div class="fld"><label>Manager work email</label><input id="nb-mgremail" type="email" placeholder="rgarcia@partnersmortgage.com"><div class="hint">They register with this email; the branch links to them automatically on first sign in</div></div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:4px">
+        <div class="fld"><label>Opening balance ($)</label><input id="nb-open" type="number" step="0.01" value="0.00"><div class="hint">Carried-in balance; use 0.00 for a fresh start. Negative allowed.</div></div>
+        <div class="fld"><label>Opening as of</label><input id="nb-date" type="date" value="${today()}"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:4px">
+        <div class="fld"><label>Monthly rent ($, optional)</label><input id="nb-rent" type="number" step="0.01" placeholder="leave blank for none"></div>
+        <div class="fld"><label>Rent posts on day</label><input id="nb-rentday" type="number" min="1" max="28" value="1"></div>
+        <div class="fld"><label>Rent starts</label><input id="nb-rentfrom" type="date" value="${today()}"></div>
+      </div>
+      <div style="margin-top:14px"><button class="btn btn-primary" onclick="addBranch()">Create branch</button></div>
+    </div>`:''}
     <div class="card">
       <h3 style="margin:0 0 6px">Overage policy rules</h3>
       <p class="muted" style="margin:0 0 12px;font-size:.86rem">Effective-dated. New versions apply prospectively; every posted loan keeps the snapshot of the rule that priced it, so history never recalculates.</p>
@@ -2359,7 +2450,8 @@ function renderAdmin(){
           <td><select class="branch-switch" ${self?'disabled':''} onchange="setUserBranch('${u.id}',this.value)">${branchOpts}</select></td>
         </tr>`;
       }).join('')}</tbody></table>
-      <h3 style="margin:18px 0 12px">Branch</h3>
+      <h3 style="margin:18px 0 6px">Branches</h3>
+      <p class="muted" style="font-size:.82rem;margin:0 0 10px">To create a new branch, use the <b>Add a branch</b> panel at the top of this screen.</p>
       <table class="tbl"><thead><tr><th>Branch</th><th>Location</th><th>Manager</th></tr></thead>
       <tbody>${S.branches.map(b=>`<tr><td style="font-weight:600">${esc(b.name)}</td><td>${esc(b.city)}</td><td>${esc((S.users.find(u=>u.id===b.manager)||{}).name||'\u2014')}</td></tr>`).join('')}</tbody></table>
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:16px">
@@ -2377,27 +2469,6 @@ function renderAdmin(){
         <div class="muted" style="font-size:.76rem;margin-top:8px">Reset wipes everything entered since go-live and reloads the original spreadsheet cutover (through May 2026). It requires typed confirmation.</div>
       </div>
     </div>
-    ${me.role!=='manager'?`
-    <div class="card">
-      <h3 style="margin:0 0 6px">Add a branch</h3>
-      <p class="muted" style="margin:0 0 12px;font-size:.86rem">Creates the branch, its manager sign-in, an opening balance entry, and an optional monthly rent rule, all in one step. The new branch appears in the top bar dropdown immediately.</p>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px">
-        <div class="fld"><label>Branch name</label><input id="nb-name" placeholder="e.g. Garcia Group"></div>
-        <div class="fld"><label>City, state</label><input id="nb-city" placeholder="e.g. Sacramento, CA"></div>
-        <div class="fld"><label>Manager full name</label><input id="nb-mgr" placeholder="e.g. Rob Garcia"></div>
-        <div class="fld"><label>Manager work email</label><input id="nb-mgremail" type="email" placeholder="rgarcia@partnersmortgage.com"><div class="hint">They register with this email; the branch links to them automatically on first sign in</div></div>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:4px">
-        <div class="fld"><label>Opening balance ($)</label><input id="nb-open" type="number" step="0.01" value="0.00"><div class="hint">Carried-in balance; use 0.00 for a fresh start. Negative allowed.</div></div>
-        <div class="fld"><label>Opening as of</label><input id="nb-date" type="date" value="${today()}"></div>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:4px">
-        <div class="fld"><label>Monthly rent ($, optional)</label><input id="nb-rent" type="number" step="0.01" placeholder="leave blank for none"></div>
-        <div class="fld"><label>Rent posts on day</label><input id="nb-rentday" type="number" min="1" max="28" value="1"></div>
-        <div class="fld"><label>Rent starts</label><input id="nb-rentfrom" type="date" value="${today()}"></div>
-      </div>
-      <div style="margin-top:14px"><button class="btn btn-primary" onclick="addBranch()">Create branch</button></div>
-    </div>`:''}
   </div>`;
   const rf=document.getElementById('restoreFile');
   if(rf) rf.addEventListener('change',restoreBackup);
