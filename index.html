@@ -182,6 +182,8 @@ main{padding:26px 30px 40px;max-width:1280px;width:100%;margin:0 auto}
 .branch-switch{border:1px solid var(--line);border-radius:8px;padding:4px 9px;font-size:.8rem;background:var(--card);color:var(--ink-soft);font-weight:600;margin-top:2px;outline:none;max-width:280px}
 .flash-ok{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--pos-soft);border:1px solid var(--pos);border-radius:12px;padding:12px 16px;margin-bottom:16px;font-size:.9rem}
 .flash-ok .fico{width:26px;height:26px;border-radius:50%;background:var(--pos);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0}
+@keyframes flashcard{0%{box-shadow:0 0 0 0 rgba(0,129,141,.55)}40%{box-shadow:0 0 0 7px rgba(0,129,141,.16)}100%{box-shadow:0 0 0 0 rgba(0,129,141,0)}}
+.flash-card{animation:flashcard 1.9s ease-out}
 .ferr{font-size:.78rem;color:var(--neg);margin-top:4px;display:none}
 .ferr.on{display:block}
 .calc-box{background:var(--teal-wash);border:1px solid #CBE2E4;border-radius:11px;padding:14px 16px}
@@ -657,7 +659,7 @@ function unpackDB(r){
   const arr=o=>o?Object.values(o):[];
   return {
     seq:{txn:(r.seq&&r.seq.txn)||0, req:(r.seq&&r.seq.req)||0},
-    users:arr(r.users).map(u=>({email:null,pending:false,uid:null,...u})), branches:arr(r.branches),
+    users:arr(r.users).map(u=>({email:null,pending:false,uid:null,...u,branches:Array.isArray(u.branches)?u.branches:[]})), branches:arr(r.branches),
     policies:arr(r.policies).sort((a,b)=>a.effectiveFrom.localeCompare(b.effectiveFrom)),
     recurring:arr(r.recurring).map(x=>({effectiveTo:null,lastGenerated:null,...x})),
     approvalTiers:Object.keys(r.approvalTiers||{}).sort().map(k=>({maxCents:null,...r.approvalTiers[k]})),
@@ -683,7 +685,7 @@ function adoptRemote(raw){
   if(me){
     me=S.users.find(u=>u.id===me.id)||null;
     if(!me){ enterAuthScreen(); return; }
-    if(me.branches[0]!=='*'){ curBranch=me.branches[0]; }
+    if(!isAllBranches(me)){ if(ubr(me)[0]) curBranch=ubr(me)[0]; }
     else if(!S.branches.some(b=>b.id===curBranch)){ curBranch=(S.branches[0]||{}).id; }
     renderAll();
   }
@@ -748,11 +750,12 @@ function migrateUsers(){
     if(seed){
       if(!u.email){ u.email=seed.email; changed=true; notes.push('email restored for '+seed.name); }
       if(!u.role||u.role!==seed.role){ u.role=seed.role; changed=true; }
-      if(!u.branches||!u.branches.length){ u.branches=seed.branches.slice(); changed=true; }
+      if(!Array.isArray(u.branches)||!u.branches.length){ u.branches=seed.branches.slice(); changed=true; }
       if(!u.init) u.init=seed.init;
       if(!u.color) u.color=seed.color;
     }
-    if(u.pending===undefined){ u.pending=!(u.branches&&u.branches.length); changed=true; }
+    if(!Array.isArray(u.branches)){ u.branches=[]; changed=true; }
+    if(u.pending===undefined){ u.pending=!u.branches.length; changed=true; }
     if(u.uid===undefined){ u.uid=null; changed=true; }
   });
   /* 2. collapse duplicate accounts that share an email (created when matching failed) */
@@ -760,7 +763,7 @@ function migrateUsers(){
   S.users.forEach(u=>{ const e=(u.email||'').toLowerCase(); if(!e) return; (byEmail[e]=byEmail[e]||[]).push(u); });
   Object.entries(byEmail).forEach(([e,list])=>{
     if(list.length<2) return;
-    const rank=u=>(SEED_IDENTITY[u.id]?4:0)+(u.pending?0:2)+((u.branches&&u.branches.length)?1:0);
+    const rank=u=>(SEED_IDENTITY[u.id]?4:0)+(u.pending?0:2)+(ubr(u).length?1:0);
     list.sort((a,b)=>rank(b)-rank(a));
     const keep=list[0];
     list.slice(1).forEach(dup=>{
@@ -782,7 +785,7 @@ function resolveAppUser(){
   if(u){
     const wasPending=u.pending;
     u.uid=authUser.uid;
-    if(u.branches&&u.branches.length) u.pending=false;   /* claimed a pre-assigned seat */
+    if(ubr(u).length) u.pending=false;   /* claimed a pre-assigned seat */
     if(wasPending&&!u.pending) logAudit('access',u.name+' registered and claimed assigned access',null);
     save();
     me=u;
@@ -796,8 +799,8 @@ function resolveAppUser(){
     save();
   }
   pendingSignupName='';
-  if(me.branches[0]!=='*'&&me.branches.length) curBranch=me.branches[0];
-  else if(me.branches[0]==='*') curBranch=(S.branches.find(b=>b.id===curBranch)?curBranch:(S.branches[0]||{}).id);
+  if(!isAllBranches(me)&&ubr(me).length) curBranch=ubr(me)[0];
+  else if(isAllBranches(me)) curBranch=(S.branches.find(b=>b.id===curBranch)?curBranch:(S.branches[0]||{}).id);
   enterApp();
 }
 function saveFbConfig(){
@@ -850,7 +853,9 @@ const VIEW_TITLES={dashboard:'Branch Financial Command Center',ledger:'Branch Le
   entry:'Transaction Entry Workspace',import:'Import Ledger Data',recurring:'Recurring Charges',
   admin:'Administration',recon:'Reconciliation & Controls',audit:'Audit Log'};
 
-function myBranch(){ if(!me) return curBranch; if(me.branches[0]==='*') return curBranch; return me.branches[0]||curBranch; }
+function ubr(u){ return (u&&Array.isArray(u.branches))?u.branches:[]; }
+function isAllBranches(u){ return ubr(u)[0]==='*'; }
+function myBranch(){ if(!me) return curBranch; if(isAllBranches(me)) return curBranch; return ubr(me)[0]||curBranch; }
 function canSee(v){ const n=NAV.find(x=>x.id===v); return n && n.roles.includes(me.role); }
 function sendFeedback(){
   const br=S.branches.find(x=>x.id===myBranch());
@@ -947,6 +952,18 @@ function renderUnassigned(){
     <div class="muted" style="font-size:.78rem;margin-top:14px">Signed in as ${esc(me.email||'')}</div>
   </div>`;
 }
+function goAddBranch(){
+  if(curView!=='admin'){ go('admin'); }
+  setTimeout(()=>{
+    const card=document.getElementById('addBranchCard');
+    if(!card){ toast('Adding branches is available to Finance Operations and Administrators.','warn'); return; }
+    try{ if(card.scrollIntoView) card.scrollIntoView({behavior:'smooth',block:'center'}); }catch(e){}
+    card.classList.add('flash-card');
+    setTimeout(()=>card.classList.remove('flash-card'),1900);
+    const f=document.getElementById('nb-name'); if(f) try{ f.focus(); }catch(e){}
+    toast('Fill in the branch details, then choose Create branch.','ok');
+  },70);
+}
 function claimSeedAccess(){
   const email=(me.email||'').toLowerCase();
   const entry=Object.entries(SEED_IDENTITY).find(([,v])=>v.email===email);
@@ -962,7 +979,7 @@ function claimSeedAccess(){
     S.users=S.users.filter(u=>u.id!==dupId);
   }
   me=target;
-  curBranch=(me.branches[0]==='*')?((S.branches[0]||{}).id):me.branches[0];
+  curBranch=isAllBranches(me)?((S.branches[0]||{}).id):ubr(me)[0];
   logAudit('access','Built-in access restored \u00b7 '+seed.name+' ('+seed.email+')',null);
   save(); curView='dashboard'; renderAll();
   toast('Welcome back, '+seed.name.split(' ')[0]+'. Full access restored.','ok');
@@ -985,21 +1002,21 @@ function go(v, d){
 }
 function accessibleBranchIds(){
   if(!me) return [];
-  if(me.branches[0]==='*') return S.branches.map(b=>b.id);
-  return me.branches.filter(bid=>S.branches.some(b=>b.id===bid));
+  if(isAllBranches(me)) return S.branches.map(b=>b.id);
+  return ubr(me).filter(bid=>S.branches.some(b=>b.id===bid));
 }
 function renderAll(){
   if(!me) return;
   if(accessibleBranchIds().length===0){ renderUnassigned(); return; }
-  if(me.branches[0]==='*' && !S.branches.some(b=>b.id===curBranch)) curBranch=S.branches[0].id;
+  if(isAllBranches(me) && !S.branches.some(b=>b.id===curBranch)) curBranch=(S.branches[0]||{}).id;
   document.querySelectorAll('.gate-hide').forEach(el=>el.classList.remove('gated'));
   renderNav();
   document.getElementById('tbTitle').textContent=VIEW_TITLES[curView];
   const bEl=document.getElementById('tbBranch');
   const curBr=S.branches.find(x=>x.id===myBranch())||S.branches[0];
-  if(me.branches[0]==='*'){
+  if(isAllBranches(me)){
     bEl.innerHTML='<select id="branchSwitch" class="branch-switch">'+S.branches.map(x=>`<option value="${x.id}" ${x.id===myBranch()?'selected':''}>${esc(x.name)} \u00b7 ${esc(x.city)}</option>`).join('')+'</select>'
-      +' <button class="btn btn-quiet btn-sm" style="margin-left:6px" onclick="go(\'admin\')" title="Add a branch or manage access">+ Add branch</button>';
+      +' <button class="btn btn-quiet btn-sm" style="margin-left:6px" onclick="goAddBranch()" title="Add a branch or manage access">+ Add branch</button>';
   }else{
     bEl.textContent=curBr.name+' \u00b7 '+curBr.city;
   }
@@ -1009,9 +1026,22 @@ function renderAll(){
   const trEl=document.getElementById('tbRole'); if(trEl) trEl.textContent=roleLabel;
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
   const el=document.getElementById('v-'+curView); el.classList.add('on');
-  ({dashboard:renderDashboard,ledger:renderLedger,pl:renderPL,statements:renderStatements,
-    requests:renderRequests,newrequest:renderNewRequest,entry:renderEntry,import:renderImport,
-    recurring:renderRecurring,admin:renderAdmin,recon:renderRecon,audit:renderAuditLog})[curView]();
+  try{
+    ({dashboard:renderDashboard,ledger:renderLedger,pl:renderPL,statements:renderStatements,
+      requests:renderRequests,newrequest:renderNewRequest,entry:renderEntry,import:renderImport,
+      recurring:renderRecurring,admin:renderAdmin,recon:renderRecon,audit:renderAuditLog})[curView]();
+  }catch(err){
+    console.error('render '+curView,err);
+    el.innerHTML=`<div class="card card-pad" style="max-width:620px;border-left:4px solid var(--neg)">
+      <h3 style="margin:0 0 8px">This screen could not be drawn</h3>
+      <p class="muted" style="font-size:.9rem;line-height:1.6">Something in the data behind <b>${esc(VIEW_TITLES[curView]||curView)}</b> is not shaped the way this screen expects, so it stopped instead of showing you something wrong. Your ledger is safe and nothing was changed.</p>
+      <p class="muted" style="font-size:.82rem;margin-top:8px">Technical detail: ${esc(String(err&&err.message||err))}</p>
+      <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="go('dashboard')">Back to Command Center</button>
+        <button class="btn btn-ghost btn-sm" onclick="sendFeedback()">Report this to Leif</button>
+      </div></div>`;
+    toast('That screen hit a data problem. Details are on screen.','err');
+  }
 }
 document.addEventListener('change',e=>{
   if(e.target.id==='branchSwitch'){ const br=S.branches.find(x=>x.id===e.target.value); if(br){ curBranch=br.id; renderAll(); toast('Viewing '+br.name,'ok'); } }
@@ -2391,7 +2421,7 @@ function renderAdmin(){
   document.getElementById('v-admin').innerHTML=`
   <div class="grid-2col" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px">
     ${me.role!=='manager'?`
-    <div class="card" style="grid-column:1/-1;border-left:4px solid var(--teal)">
+    <div class="card" id="addBranchCard" style="grid-column:1/-1;border-left:4px solid var(--teal)">
       <h3 style="margin:0 0 6px">Add a branch</h3>
       <p class="muted" style="margin:0 0 12px;font-size:.86rem">Creates the branch, its manager sign-in, an opening balance entry, and an optional monthly rent rule, all in one step. The new branch appears in the top bar dropdown immediately.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px">
@@ -2441,7 +2471,7 @@ function renderAdmin(){
       <table class="tbl"><thead><tr><th>Name / email</th><th>Role</th><th>Branch access</th></tr></thead>
       <tbody>${[...S.users].sort((a,b)=>(b.pending?1:0)-(a.pending?1:0)).map(u=>{
         const roleOpts=[['manager','Branch Manager'],['finance','Finance Operations'],['admin','Administrator']].map(([v,l])=>`<option value="${v}" ${u.role===v?'selected':''}>${l}</option>`).join('');
-        const branchVal=u.branches[0]==='*'?'*':(u.branches[0]||'');
+        const branchVal=ubr(u)[0]==='*'?'*':(ubr(u)[0]||'');
         const branchOpts=`<option value="" ${!branchVal?'selected':''}>Not assigned</option><option value="*" ${branchVal==='*'?'selected':''}>All branches (Finance/Admin)</option>`+S.branches.map(b=>`<option value="${b.id}" ${branchVal===b.id?'selected':''}>${esc(b.name)}</option>`).join('');
         const self=u.id===me.id;
         return `<tr>
@@ -2479,12 +2509,12 @@ function renderAdmin(){
   if(sa) sa.innerHTML='<span class="muted" style="font-size:.8rem">Signed in as '+esc(authUser?authUser.email:(me?me.email:''))+'</span>';
 }
 function slugId(name){ return name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||('b'+Date.now()); }
-function clearPendingIfAssigned(u){ if(u.branches.length && u.pending){ u.pending=false; if(u.title==='Pending access') u.title=(u.role==='manager'?'Branch Manager':u.role==='finance'?'Finance Operations':'Administrator'); } }
+function clearPendingIfAssigned(u){ if(!Array.isArray(u.branches)) u.branches=[]; if(u.branches.length && u.pending){ u.pending=false; if(u.title==='Pending access') u.title=(u.role==='manager'?'Branch Manager':u.role==='finance'?'Finance Operations':'Administrator'); } }
 function setUserRole(uid,role){
   const u=S.users.find(x=>x.id===uid); if(!u) return;
   u.role=role;
   if(role!=='manager') u.branches=['*'];
-  else if(u.branches[0]==='*') u.branches=[];
+  else if(ubr(u)[0]==='*') u.branches=[];
   clearPendingIfAssigned(u);
   logAudit('access','Role set \u00b7 '+u.name+' \u2192 '+role,null);
   save(); renderAdmin(); toast(u.name+' is now '+({manager:'a Branch Manager',finance:'Finance Operations',admin:'an Administrator'}[role]),'ok');
@@ -2546,8 +2576,8 @@ function restoreBackup(e){
       confirmModal('Restore this backup?','This replaces everything currently in the app with the contents of '+f.name+' ('+data.transactions.length+' journal entries, '+data.requests.length+' requests, '+data.branches.length+' branch(es)). The current data is overwritten.','Restore',()=>{
         S=data; save();
         me=S.users.find(u=>u.id===me.id)||S.users[0];
-        if(me.branches[0]!=='*') curBranch=me.branches[0];
-        else if(!S.branches.some(b=>b.id===curBranch)) curBranch=S.branches[0].id;
+        if(!isAllBranches(me)&&ubr(me)[0]) curBranch=ubr(me)[0];
+        else if(!S.branches.some(b=>b.id===curBranch)) curBranch=(S.branches[0]||{}).id;
         logAudit('admin','Data restored from backup '+f.name,null); save();
         renderAll(); toast('Backup restored \u00b7 '+S.transactions.length+' journal entries loaded','ok');
       });
@@ -2561,7 +2591,7 @@ function resetToCutover(){
     if((v||'').trim().toUpperCase()!=='RESET'){ toast('Reset cancelled. Type RESET exactly to confirm.','warn'); return false; }
     store.del(DB_KEY); const prev=me?me.id:null; seedDB();
     me=S.users.find(u=>u.id===prev)||S.users[0];
-    curBranch=(me.branches[0]!=='*')?me.branches[0]:S.branches[0].id;
+    curBranch=(!isAllBranches(me)&&ubr(me)[0])?ubr(me)[0]:(S.branches[0]||{}).id;
     renderAll(); toast('Ledger reset to spreadsheet cutover','ok'); return true;
   });
 }
