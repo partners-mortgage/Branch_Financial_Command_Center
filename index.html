@@ -430,6 +430,11 @@ function fmt$(c, opts){
   return (opts&&opts.paren)?'('+s+')':'\u2212'+s;
 }
 function fmt$s(c){ return fmt$(c,{paren:true}); }
+function pctMul(amountCents, pct){
+  /* amount * pct%, decimal-safe: pct kept to 2 decimals -> integer hundredths */
+  const h=Math.round((pct||0)*100);
+  return Math.round(amountCents*h/10000);
+}
 function bpsMul(amountCents, bps){
   /* amount * bps / 10000, decimal-safe: bps kept to 1 decimal -> integer tenths */
   const tenths=Math.round(bps*10);
@@ -488,7 +493,7 @@ function defaultDB(){
     ],
     branches:[ {id:'malmstrom', name:'Malmstrom Group', city:'Roseville, CA', manager:'u-jason'} ],
     policies:[
-      {version:'R1', effectiveFrom:'2000-01-01', marginThresholdBps:275, procBaselineCents:79500, note:'Original overage policy from the Malmstrom ledger'}
+      {version:'R1', effectiveFrom:'2000-01-01', marginThresholdBps:275, procBaselineCents:79500, note:'Legacy spreadsheet rule \u00b7 branch keeps margin above threshold'}
     ],
     approvalTiers:[
       {maxCents:100000, approvers:['finance'], label:'Up to $1,000: Finance Operations'},
@@ -508,12 +513,72 @@ function policyFor(dateStr){
   const eligible=S.policies.filter(p=>p.effectiveFrom<=dateStr).sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom));
   return eligible[0]||S.policies[0];
 }
-function calcLoan(loanAmountCents, actualBps, procFeeCents, pol){
+/* Which compensation basis applies: below the margin threshold a loan officer is
+   paid a percentage of the margin earned; at or above it they are paid in bps. */
+function loCompModeFor(actualBps, pol){ return (actualBps>=pol.marginThresholdBps)?'bps':'pct'; }
+function branchTakePctOf(pol){ return (pol.branchTakePct===undefined||pol.branchTakePct===null)?73:pol.branchTakePct; }
+function corpTakePctOf(pol){ return Math.round((100-branchTakePctOf(pol))*100)/100; }
+function branchNetBpsOf(pol){ return (pol.branchNetBps===undefined||pol.branchNetBps===null)?null:pol.branchNetBps; }
+function corpTakeBpsOf(pol){ const bn=branchNetBpsOf(pol); return bn===null?null:Math.round((pol.marginThresholdBps-bn)*10)/10; }
+/* A rule uses the full waterfall once a branch net (bps) is defined on it.
+   The original R1 rule has none, so every historical loan keeps the old math. */
+function usesWaterfall(pol){ return branchNetBpsOf(pol)!==null; }
+
+function calcLoan(loanAmountCents, actualBps, procFeeCents, pol, o){
+  o=o||{};
   const overageBps=Math.max(Math.round((actualBps-pol.marginThresholdBps)*10)/10,0);
-  const marginOverageCents=bpsMul(loanAmountCents,overageBps);
   const procOverageCents=Math.max((procFeeCents||0)-pol.procBaselineCents,0);
-  return {overageBps,marginOverageCents,procOverageCents,netCents:marginOverageCents+procOverageCents,
-    thresholdBps:pol.marginThresholdBps, procBaselineCents:pol.procBaselineCents, ruleVersion:pol.version};
+  const base={overageBps, procOverageCents, thresholdBps:pol.marginThresholdBps,
+    procBaselineCents:pol.procBaselineCents, ruleVersion:pol.version};
+
+  /* Branch-manager originated: the branch keeps margin above the threshold.
+     This is the original rule and every historical loan stays on it. */
+  if(o.originator!=='lo'){
+    const marginOverageCents=bpsMul(loanAmountCents,overageBps);
+    return {...base, originator:'manager',
+      marginOverageCents, netCents:marginOverageCents+procOverageCents};
+  }
+
+  /* Loan-officer originated. The equation is the same either way:
+       total margin  -  corp take  -  LO comp  =  net to branch P&L
+     Only the BASIS changes. At or above the threshold the deal is lender paid and
+     everything is priced in basis points of the loan. Below the threshold it is
+     borrower paid and everything is priced as a percent of the margin earned. */
+  const totalMarginCents=bpsMul(loanAmountCents, actualBps);
+  const mode=o.loCompMode||loCompModeFor(actualBps,pol);
+  const lenderPaid=(mode==='bps');
+  const takePct=branchTakePctOf(pol);
+  const corpTakePct=corpTakePctOf(pol);
+  const bNetBps=branchNetBpsOf(pol);
+  const cTakeBps=corpTakeBpsOf(pol);
+
+  let corpTakeCents, corpBasis;
+  if(lenderPaid && cTakeBps!==null){
+    corpTakeCents=bpsMul(loanAmountCents, cTakeBps);
+    corpBasis=cTakeBps+' bps of loan';
+  }else{
+    corpTakeCents=pctMul(totalMarginCents, corpTakePct);
+    corpBasis=corpTakePct+'% of margin';
+  }
+  const branchShareCents=totalMarginCents-corpTakeCents;
+
+  const loCompPct=(mode==='pct')?(parseFloat(o.loCompPct)||0):null;
+  const loCompBps=(mode==='bps')?(parseFloat(o.loCompBps)||0):null;
+  const loCompCents=lenderPaid?bpsMul(loanAmountCents, loCompBps)
+                              :pctMul(totalMarginCents, loCompPct);
+  const marginOverageCents=branchShareCents-loCompCents;
+  return {...base, originator:'lo', loName:o.loName||null,
+    compBasis:lenderPaid?'lender-paid':'borrower-paid',
+    totalMarginCents, branchTakePct:takePct, corpTakePct, branchNetBps:bNetBps, corpTakeBps:cTakeBps,
+    corpTakeCents, corpBasis, branchShareCents,
+    loCompMode:mode, loCompPct, loCompBps, loCompCents,
+    marginOverageCents, netCents:marginOverageCents+procOverageCents};
+}
+/* names already used on this branch, so Janine can pick instead of retyping */
+function knownLOs(){
+  const set={};
+  branchTxns(myBranch()).forEach(t=>{ if(t.type==='loan'&&t.detail&&t.detail.loName) set[t.detail.loName]=1; });
+  return Object.keys(set).sort();
 }
 
 /* ---------- journal ---------- */
@@ -1303,9 +1368,28 @@ function openTxn(id){
   const t=S.transactions.find(x=>x.id===id); if(!t) return;
   const d=t.detail||{};
   let calcHtml='';
-  if(t.type==='loan'&&t.detail){
+  if(t.type==='loan'&&t.detail&&d.originator==='lo'){
+    calcHtml=`<div class="calc-box" style="margin-top:16px">
+      <div class="kpi-label" style="margin-bottom:8px">Loan officer deal \u00b7 rule ${d.ruleVersion} (snapshot at posting)</div>
+      <div class="calc-line"><span>Loan officer</span><span><b>${esc(d.loName||'\u2014')}</b></span></div>
+      <div class="calc-line"><span>Loan amount</span><span>${fmt$(d.loanAmountCents)}</span></div>
+      <div class="calc-line"><span>Actual margin</span><span>${d.actualBps} bps ${d.actualBps<d.thresholdBps?'<span class="chip c-gold" style="font-size:.65rem">below '+d.thresholdBps+'</span>':''}</span></div>
+      <div class="calc-line"><span>Compensation basis</span><span><b>${d.compBasis==='lender-paid'?'Lender paid':'Borrower paid'}</b></span></div>
+      ${d.branchNetBps!==undefined&&d.branchNetBps!==null?`<div class="calc-line"><span>Branch net at threshold (${d.ruleVersion})</span><span>${d.branchNetBps} bps \u00b7 corp ${d.corpTakeBps} bps</span></div>`:''}
+      <div class="calc-line" style="margin-top:8px"><span>Total margin = loan \u00d7 ${d.actualBps} bps</span><span>${fmt$(d.totalMarginCents)}</span></div>
+      <div class="calc-line"><span>Less corp take${d.corpBasis?' @ '+esc(d.corpBasis):' @ '+(100-d.branchTakePct)+'% of margin'}</span><span style="color:var(--neg)">(${fmt$(d.corpTakeCents!==undefined?d.corpTakeCents:(d.totalMarginCents-d.branchShareCents))})</span></div>
+      <div class="calc-line"><span>Branch share</span><span><b>${fmt$s(d.branchShareCents)}</b></span></div>
+      <div class="calc-line"><span>Less LO comp ${d.loCompMode==='pct'?'@ '+d.loCompPct+'% of margin':'@ '+d.loCompBps+' bps of loan'}</span><span style="color:var(--neg)">(${fmt$(d.loCompCents)})</span></div>
+      <div class="calc-line"><span>Net margin to branch P&amp;L</span><span><b>${fmt$s(d.marginOverageCents)}</b></span></div>
+      <div class="calc-line" style="margin-top:8px"><span>Processing fee collected</span><span>${fmt$(d.procFeeCents)}</span></div>
+      <div class="calc-line"><span>Processing baseline (${d.ruleVersion})</span><span>${fmt$(d.procBaselineCents)}</span></div>
+      <div class="calc-line"><span>Processing overage = max(fee \u2212 baseline, 0)</span><span><b>${fmt$(d.procOverageCents)}</b></span></div>
+      <div class="calc-line total"><span>Net credit to branch</span><span>${fmt$s(t.amountCents)}</span></div>
+    </div>`;
+  } else if(t.type==='loan'&&t.detail){
     calcHtml=`<div class="calc-box" style="margin-top:16px">
       <div class="kpi-label" style="margin-bottom:8px">Overage calculation \u00b7 rule ${d.ruleVersion} (snapshot at posting)</div>
+      <div class="calc-line"><span>Originated by</span><span>Branch manager</span></div>
       <div class="calc-line"><span>Loan amount</span><span>${fmt$(d.loanAmountCents)}</span></div>
       <div class="calc-line"><span>Actual margin</span><span>${d.actualBps} bps</span></div>
       <div class="calc-line"><span>Margin threshold (${d.ruleVersion})</span><span>${d.thresholdBps} bps</span></div>
@@ -1329,6 +1413,7 @@ function openTxn(id){
       <div class="k">Entered by</div><div class="v">${esc(userName(t.createdBy))}</div>
       <div class="k">Description</div><div class="v">${esc(t.desc)}</div>
       ${d.borrower?`<div class="k">Borrower</div><div class="v">${esc(d.borrower)}</div><div class="k">Loan number</div><div class="v">${esc(d.loanNumber)}</div>`:''}
+      ${t.type==='loan'?`<div class="k">Originated by</div><div class="v">${d.originator==='lo'?'Loan officer \u00b7 <b>'+esc(d.loName||'\u2014')+'</b>':'Branch manager'}</div>`:''}
       ${d.category?`<div class="k">Category</div><div class="v">${esc(d.category)}</div>`:''}
       <div class="k">Signed amount</div><div class="v" style="font-weight:800;font-size:1.05rem" class="mono-num">${fmt$s(t.amountCents)}</div>
       ${t.reverses?`<div class="k">Reverses</div><div class="v">${t.reverses}</div>`:''}
@@ -1527,10 +1612,10 @@ function printStatement(mk){
   }).join('');
   const loans=rows.filter(t=>t.type==='loan'&&t.detail);
   const loanRows=loans.map(t=>{const d=t.detail;return `<tr>
-    <td>${fmtDate(t.date)}</td><td>${esc(d.borrower)}</td><td>${d.loanNumber}</td>
+    <td>${fmtDate(t.date)}</td><td>${esc(d.borrower)}${d.originator==='lo'?'<div class="pr-note">'+(d.compBasis==='lender-paid'?'Lender paid':'Borrower paid')+' \u00b7 LO '+esc(d.loName||'')+' \u00b7 comp '+(d.loCompMode==='pct'?d.loCompPct+'% of margin':d.loCompBps+' bps')+' = '+fmt$(d.loCompCents)+' \u00b7 corp take '+fmt$(d.corpTakeCents!==undefined?d.corpTakeCents:0)+'</div>':''}</td><td>${d.loanNumber}</td>
     <td class="num">${fmt$(d.loanAmountCents)}</td>
-    <td class="num">${d.actualBps}</td><td class="num">${d.thresholdBps}</td><td class="num">${d.overageBps}</td>
-    <td class="num">${fmt$(d.marginOverageCents)}</td>
+    <td class="num">${d.actualBps}</td><td class="num">${d.thresholdBps}</td><td class="num">${d.originator==='lo'?'\u2014':d.overageBps}</td>
+    <td class="num">${fmt$s(d.marginOverageCents)}</td>
     <td class="num">${fmt$(d.procFeeCents)}</td><td class="num">${fmt$(d.procBaselineCents)}</td><td class="num">${fmt$(d.procOverageCents)}</td>
     <td class="num"><b>${fmt$(t.amountCents)}</b></td><td>${d.ruleVersion}</td></tr>`;}).join('');
   const lt=loans.reduce((a,t)=>{const d=t.detail;a.amt+=d.loanAmountCents;a.m+=d.marginOverageCents;a.p+=d.procOverageCents;a.n+=t.amountCents;return a;},{amt:0,m:0,p:0,n:0});
@@ -1551,7 +1636,7 @@ function printStatement(mk){
       <th class="num">Proc. fee</th><th class="num">Baseline</th><th class="num">Proc. overage</th><th class="num">Net credit</th><th>Rule</th></tr></thead>
     <tbody>${loanRows}
     <tr class="tot"><td colspan="3">Totals</td><td class="num">${fmt$(lt.amt)}</td><td colspan="3"></td><td class="num">${fmt$(lt.m)}</td><td colspan="2"></td><td class="num">${fmt$(lt.p)}</td><td class="num">${fmt$(lt.n)}</td><td></td></tr></tbody></table>
-    <p class="pr-note">Each net credit equals margin overage plus processing overage, priced under the rule version shown, snapshotted at posting. Reporting month is derived from the transaction date.</p>`:''}
+    <p class="pr-note">Branch-manager deals credit the margin above the threshold. Loan-officer deals credit the branch share of the full margin less loan officer compensation, which is why they produce revenue below the threshold; the LO comp shown was netted at funding and never entered the branch ledger. Each net credit adds processing overage, priced under the rule version shown and snapshotted at posting. Reporting month is derived from the transaction date.</p>`:''}
     ${prFoot('Reconciles to journal entries '+(rows.length?rows[0].id+' \u2013 '+rows[rows.length-1].id:'\u2014'))}`;
   window.print();
 }
@@ -1560,10 +1645,14 @@ function printStatement(mk){
 function printPL(from,to,label){
   const b=myBranch();
   const inPeriod=branchTxns(b).filter(t=>t.type!=='opening'&&t.date>=from&&t.date<=to);
-  let marginOv=0,procOv=0,otherCr=0;
+  let marginOv=0,procOv=0,otherCr=0,mgrOv=0,loOv=0,loComp=0,loMargin=0,loCount=0,loCorp=0;
   const exp={};
   inPeriod.forEach(t=>{
-    if(t.type==='loan'&&t.detail){ marginOv+=t.detail.marginOverageCents; procOv+=t.detail.procOverageCents; return; }
+    if(t.type==='loan'&&t.detail){ marginOv+=t.detail.marginOverageCents; procOv+=t.detail.procOverageCents;
+      if(t.detail.originator==='lo'){ loOv+=t.detail.marginOverageCents; loComp+=(t.detail.loCompCents||0); loMargin+=(t.detail.totalMarginCents||0);
+        loCorp+=(t.detail.corpTakeCents!==undefined?t.detail.corpTakeCents:((t.detail.totalMarginCents||0)-(t.detail.branchShareCents||0))); loCount++; }
+      else mgrOv+=t.detail.marginOverageCents;
+      return; }
     if(t.amountCents>=0){ otherCr+=t.amountCents; return; }
     const cat=(t.detail&&t.detail.category)||'Other';
     exp[cat]=(exp[cat]||0)+(-t.amountCents);
@@ -1588,7 +1677,8 @@ function printPL(from,to,label){
     ${prHead('Internal Management P&L \u00b7 '+label)}
     <div class="pr-sec">Revenue \u00b7 branch credits</div>
     <table class="pr-tbl">
-      <tr><td>Margin overage (above rule threshold)</td><td class="num">${fmt$(marginOv)}</td></tr>
+      <tr><td>Margin retained \u00b7 branch manager deals (above threshold)</td><td class="num">${fmt$s(mgrOv)}</td></tr>
+      <tr><td>Margin retained \u00b7 loan officer deals (branch share less LO comp)</td><td class="num">${fmt$s(loOv)}</td></tr>
       <tr><td>Processing overage (above rule baseline)</td><td class="num">${fmt$(procOv)}</td></tr>
       <tr><td>Other credits & adjustments</td><td class="num">${fmt$(otherCr)}</td></tr>
       <tr class="tot"><td>Total credits</td><td class="num">${fmt$(totalRev)}</td></tr></table>
@@ -1603,6 +1693,15 @@ function printPL(from,to,label){
     ${mRows?`<div class="pr-sec">Month-by-month</div>
     <table class="pr-tbl small"><thead><tr><th>Month</th><th class="num">Margin overage</th><th class="num">Processing overage</th><th class="num">Other credits</th><th class="num">Debits</th><th class="num">Net</th></tr></thead>
     <tbody>${mRows}</tbody></table>`:''}
+    ${loCount?`<div class="pr-sec">Margin waterfall \u00b7 loan officer deals \u00b7 memo</div>
+    <table class="pr-tbl">
+      <tr><td>Loan officer deals funded</td><td class="num">${loCount}</td></tr>
+      <tr><td>Total margin generated</td><td class="num">${fmt$(loMargin)}</td></tr>
+      <tr><td>Less corporate take</td><td class="num">(${fmt$(loCorp)})</td></tr>
+      <tr><td>Less loan officer compensation</td><td class="num">(${fmt$(loComp)})</td></tr>
+      <tr class="tot"><td>Net margin to branch P&amp;L</td><td class="num">${fmt$s(loOv)}</td></tr>
+    </table>
+    <p class="pr-note">Memo only. Corporate take and loan officer compensation are netted at funding and never pass through the branch ledger, so they are not expense lines above. Total margin less corp take less LO comp equals the net margin credited to the branch.</p>`:''}
     <p class="pr-note">Internal management view built from the posted branch journal; not a formal accounting statement. Net branch activity is a period measure; the ledger balance is a roll-forward. Every debit reports in the month of its transaction date.</p>
     ${prFoot('Period '+fmtDate(from)+' \u2013 '+fmtDate(to))}`;
   window.print();
@@ -2049,6 +2148,24 @@ function drawLoanEntry(){
         <div class="fld"><label>Actual margin (bps)</label><input type="text" id="le-bps" inputmode="decimal" placeholder="e.g. 312.5"></div>
         <div class="fld"><label>Processing fee collected</label><input type="text" id="le-fee" inputmode="decimal" placeholder="0.00"></div>
       </div>
+      <div style="border-top:1px solid var(--line);margin:14px 0 12px;padding-top:12px">
+        <div class="frow f2">
+          <div class="fld"><label>Originated by</label>
+            <select id="le-orig"><option value="manager">Branch manager</option><option value="lo">Loan officer</option></select>
+            <div class="hint">Loan officer deals earn the branch a share of the full margin, even below the threshold</div></div>
+          <div class="fld" id="le-lo-wrap" style="display:none"><label>Loan officer</label>
+            <input type="text" id="le-lo" list="loList" placeholder="Last name or full name">
+            <datalist id="loList">${knownLOs().map(n=>`<option value="${esc(n)}">`).join('')}</datalist></div>
+        </div>
+        <div class="frow f2" id="le-comp-wrap" style="display:none">
+          <div class="fld"><label>LO comp basis</label>
+            <select id="le-compmode"><option value="pct">Percent of margin</option><option value="bps">Basis points of loan</option></select>
+            <div class="hint" id="le-modehint"></div></div>
+          <div class="fld"><label id="le-complabel">LO comp</label>
+            <input type="text" id="le-compval" inputmode="decimal" placeholder="e.g. 50">
+            <div class="hint" id="le-comphint"></div></div>
+        </div>
+      </div>
       <div style="display:flex;gap:10px;margin-top:6px">
         <button class="btn btn-primary" onclick="postLoanEntry()">Post to ledger</button>
         <span class="locked-note">Calculated fields at right are locked and recompute as you type</span>
@@ -2056,23 +2173,66 @@ function drawLoanEntry(){
     </div>
     <div class="calc-box" id="le-calc"></div>
   </div>`;
-  ['le-amt','le-bps','le-fee','le-date'].forEach(id=>document.getElementById(id).addEventListener('input',updateLoanCalc));
+  ['le-amt','le-bps','le-fee','le-date','le-lo','le-compval'].forEach(id=>document.getElementById(id).addEventListener('input',updateLoanCalc));
+  ['le-orig','le-compmode'].forEach(id=>document.getElementById(id).addEventListener('change',()=>{ loModeTouched=(id==='le-compmode'); updateLoanCalc(); }));
   updateLoanCalc();
 }
+let loModeTouched=false;
 function updateLoanCalc(){
-  const date=document.getElementById('le-date').value||today();
+  const g=id=>document.getElementById(id);
+  const date=g('le-date').value||today();
   const pol=policyFor(date);
-  const amt=toCents(document.getElementById('le-amt').value)||0;
-  const bps=parseFloat(document.getElementById('le-bps').value)||0;
-  const fee=toCents(document.getElementById('le-fee').value)||0;
-  const c=calcLoan(amt,bps,fee,pol);
+  const amt=toCents(g('le-amt').value)||0;
+  const bps=parseFloat(g('le-bps').value)||0;
+  const fee=toCents(g('le-fee').value)||0;
+  const isLO=g('le-orig').value==='lo';
+  g('le-lo-wrap').style.display=isLO?'block':'none';
+  g('le-comp-wrap').style.display=isLO?'flex':'none';
+
+  /* the basis follows the threshold rule unless Janine deliberately overrides it */
+  const auto=loCompModeFor(bps,pol);
+  if(isLO&&!loModeTouched) g('le-compmode').value=auto;
+  const mode=g('le-compmode').value;
+  g('le-complabel').textContent = mode==='pct' ? 'LO comp (% of margin)' : 'LO comp (bps of loan)';
+  g('le-modehint').innerHTML = (mode===auto)
+    ? `Set automatically: ${bps? (bps>=pol.marginThresholdBps?'at or above':'below') : 'below'} the ${pol.marginThresholdBps} bps threshold`
+    : `<b style="color:var(--gold-dark,#9a6a00)">Overridden.</b> The threshold rule says ${auto==='pct'?'percent of margin':'basis points'}.`;
+  g('le-comphint').textContent = mode==='pct' ? 'e.g. 50 means the LO receives 50% of the total margin' : 'e.g. 125 means the LO receives 1.25% of the loan amount';
+
+  const compVal=parseFloat(g('le-compval').value)||0;
+  const c=calcLoan(amt,bps,fee,pol,{originator:isLO?'lo':'manager', loName:g('le-lo').value.trim(),
+    loCompMode:mode, loCompPct:mode==='pct'?compVal:0, loCompBps:mode==='bps'?compVal:0});
   const bal=postedBalance(myBranch());
-  document.getElementById('le-calc').innerHTML=`
-    <div class="kpi-label" style="margin-bottom:8px">Live calculation \u00b7 rule ${pol.version} (threshold ${pol.marginThresholdBps} bps \u00b7 baseline ${fmt$(pol.procBaselineCents)})</div>
+
+  const latest=S.policies.slice().sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom))[0];
+  const stale=(latest&&latest.version!==pol.version)
+    ? `<div class="calc-line" style="color:var(--gold-dark,#9a6a00)"><span>Dated ${fmtDate(date)}, so it prices under ${pol.version}</span><span>${latest.version} (${latest.marginThresholdBps} bps) starts ${fmtDate(latest.effectiveFrom)}</span></div>` : '';
+  const ruleFields=`
+    <div class="calc-line"><span>Margin threshold (${pol.version})</span><span><b>${pol.marginThresholdBps} bps</b></span></div>
+    ${branchNetBpsOf(pol)!==null?`<div class="calc-line"><span>Branch net at threshold \u00b7 lender paid</span><span><b>${branchNetBpsOf(pol)} bps</b> (corp ${corpTakeBpsOf(pol)} bps)</span></div>
+    <div class="calc-line"><span>Branch share \u00b7 borrower paid</span><span><b>${branchTakePctOf(pol)}%</b> (corp ${corpTakePctOf(pol)}%)</span></div>`:''}
+    ${stale}`;
+  const head=`<div class="kpi-label" style="margin-bottom:8px">Live calculation \u00b7 rule ${pol.version}${isLO?' \u00b7 '+(mode==='bps'?'lender paid':'borrower paid'):''}</div>`+ruleFields+`<div style="border-top:1px solid rgba(0,0,0,.08);margin:8px 0"></div>`;
+  let body;
+  if(isLO){
+    body=`
+    <div class="calc-line"><span>Total margin = loan \u00d7 ${bps||0} bps</span><span>${fmt$(c.totalMarginCents)}</span></div>
+    <div class="calc-line"><span>Less corp take @ ${esc(c.corpBasis)}</span><span style="color:var(--neg)">(${fmt$(c.corpTakeCents)})</span></div>
+    <div class="calc-line"><span>Branch share</span><span><b>${fmt$s(c.branchShareCents)}</b></span></div>
+    <div class="calc-line"><span>Less LO comp ${mode==='pct'?'@ '+compVal+'% of margin':'@ '+compVal+' bps of loan'}</span><span style="color:var(--neg)">(${fmt$(c.loCompCents)})</span></div>
+    <div class="calc-line"><span>Net margin to branch P&amp;L</span><span><b>${fmt$s(c.marginOverageCents)}</b></span></div>
+    <div class="calc-line" style="margin-top:8px"><span>Processing overage $</span><span><b>${fmt$(c.procOverageCents)}</b></span></div>`;
+  }else{
+    body=`
     <div class="calc-line"><span>Margin overage bps</span><span><b>${c.overageBps}</b></span></div>
     <div class="calc-line"><span>Margin overage $</span><span><b>${fmt$(c.marginOverageCents)}</b></span></div>
-    <div class="calc-line"><span>Processing overage $</span><span><b>${fmt$(c.procOverageCents)}</b></span></div>
-    <div class="calc-line total"><span>Net credit to branch</span><span>${fmt$(c.netCents)}</span></div>
+    <div class="calc-line"><span>Processing overage $</span><span><b>${fmt$(c.procOverageCents)}</b></span></div>`;
+  }
+  const warn = (isLO&&c.netCents<0)
+    ? `<div class="calc-line" style="color:var(--neg)"><span>This deal costs the branch money</span><span>LO comp exceeds the branch share</span></div>` : '';
+  g('le-calc').innerHTML=head+body+`
+    <div class="calc-line total"><span>Net credit to branch</span><span style="${c.netCents<0?'color:var(--neg)':''}">${fmt$s(c.netCents)}</span></div>
+    ${warn}
     <div class="calc-line"><span>Resulting balance</span><span style="${bal+c.netCents<0?'color:var(--neg)':''}">${fmt$s(bal+c.netCents)}</span></div>`;
 }
 function dupLoan(ln){ return branchTxns(myBranch()).some(t=>t.type==='loan'&&!t.reversedBy&&t.detail&&t.detail.loanNumber===ln); }
@@ -2081,9 +2241,17 @@ function postLoanEntry(){
   const date=g('le-date').value, ln=g('le-ln').value.trim(), borrower=g('le-borrower').value.trim();
   const amt=toCents(g('le-amt').value), bps=parseFloat(g('le-bps').value), fee=toCents(g('le-fee').value)||0;
   if(!date||!ln||!borrower||!amt||isNaN(bps)){ toast('Date, loan number, borrower, amount, and margin are required','warn'); return; }
+  const isLO=g('le-orig').value==='lo';
+  const loName=g('le-lo').value.trim();
+  const mode=g('le-compmode').value;
+  const compVal=parseFloat(g('le-compval').value);
+  if(isLO&&!loName){ toast('Enter the loan officer name, or switch Originated by to branch manager','warn'); return; }
+  if(isLO&&(isNaN(compVal)||compVal<0)){ toast('Enter the loan officer compensation'+(mode==='pct'?' as a percent of margin':' in basis points'),'warn'); return; }
+  const opts=isLO?{originator:'lo',loName,loCompMode:mode,loCompPct:mode==='pct'?compVal:0,loCompBps:mode==='bps'?compVal:0}:{originator:'manager'};
   const doPost=(overrideNote)=>{
-    const pol=policyFor(date); const c=calcLoan(amt,bps,fee,pol);
-    const t=postTxn({branch:myBranch(),type:'loan',date,desc:'Funded loan \u00b7 '+borrower+' \u00b7 #'+ln,
+    const pol=policyFor(date); const c=calcLoan(amt,bps,fee,pol,opts);
+    const t=postTxn({branch:myBranch(),type:'loan',date,
+      desc:'Funded loan \u00b7 '+borrower+' \u00b7 #'+ln+(isLO?' \u00b7 LO '+loName:''),
       amountCents:c.netCents,createdBy:me.id,
       detail:{borrower,loanNumber:ln,loanAmountCents:amt,actualBps:bps,procFeeCents:fee,...c,override:overrideNote||null}});
     save(); sessionPosts.unshift(t.id);
@@ -2104,7 +2272,7 @@ function drawBatchEntry(){
   document.getElementById('entryBody').innerHTML=`
   <div class="card card-pad">
     <div class="kpi-label" style="margin-bottom:12px">Batch funded loan entry \u00b7 Tab through cells, calculations preview before posting</div>
-    <table class="tbl"><thead><tr><th>Date funded</th><th>Borrower</th><th>Loan #</th><th class="num">Loan amount</th><th class="num">Margin bps</th><th class="num">Proc. fee</th><th class="num">Net credit (calc)</th><th></th></tr></thead>
+    <table class="tbl"><thead><tr><th>Date funded</th><th>Borrower</th><th>Loan #</th><th class="num">Loan amount</th><th class="num">Margin bps</th><th class="num">Proc. fee</th><th>Loan officer</th><th class="num">LO comp</th><th class="num">Net credit (calc)</th><th></th></tr></thead>
     <tbody>${batchRows.map((r,i)=>`<tr>
         <td><input type="date" style="border:1px solid var(--line);border-radius:7px;padding:6px" value="${r.date||''}" oninput="batchRows[${i}].date=this.value;updBatch(${i})"></td>
         <td><input type="text" style="border:1px solid var(--line);border-radius:7px;padding:6px;width:120px" value="${esc(r.borrower||'')}" oninput="batchRows[${i}].borrower=this.value"></td>
@@ -2112,6 +2280,8 @@ function drawBatchEntry(){
         <td><input type="text" inputmode="decimal" style="border:1px solid var(--line);border-radius:7px;padding:6px;width:105px;text-align:right" value="${esc(r.amt||'')}" oninput="batchRows[${i}].amt=this.value;updBatch(${i})"></td>
         <td><input type="text" inputmode="decimal" style="border:1px solid var(--line);border-radius:7px;padding:6px;width:75px;text-align:right" value="${esc(r.bps??'')}" oninput="batchRows[${i}].bps=this.value;updBatch(${i})"></td>
         <td><input type="text" inputmode="decimal" style="border:1px solid var(--line);border-radius:7px;padding:6px;width:80px;text-align:right" value="${esc(r.fee||'')}" oninput="batchRows[${i}].fee=this.value;updBatch(${i})"></td>
+        <td><input type="text" list="loList" style="border:1px solid var(--line);border-radius:7px;padding:6px;width:100px" placeholder="none" value="${esc(r.lo||'')}" oninput="batchRows[${i}].lo=this.value;updBatch(${i})"></td>
+        <td><input type="text" inputmode="decimal" style="border:1px solid var(--line);border-radius:7px;padding:6px;width:78px;text-align:right" placeholder="\u2014" value="${esc(r.comp||'')}" oninput="batchRows[${i}].comp=this.value;updBatch(${i})"></td>
         <td class="num" style="font-weight:600" id="b-net-${i}"></td>
         <td><button class="btn btn-quiet btn-sm" onclick="batchRows.splice(${i},1);drawBatchEntry()">\u00d7</button></td>
       </tr>`).join('')}</tbody></table>
@@ -2120,17 +2290,31 @@ function drawBatchEntry(){
       <span style="flex:1"></span>
       <button class="btn btn-primary" onclick="postBatch()">Post all valid rows</button>
     </div>
-    <p class="hint" style="margin-top:8px;color:var(--gray);font-size:.8rem">Tab moves left to right through each row. Calculations update as you type without interrupting your cursor.</p>
+    <datalist id="loList">${knownLOs().map(n=>`<option value="${esc(n)}">`).join('')}</datalist>
+    <p class="hint" style="margin-top:8px;color:var(--gray);font-size:.8rem">Tab moves left to right through each row. Calculations update as you type without interrupting your cursor. Leave Loan officer blank for branch-manager deals. When a loan officer is named, LO comp is read as a <b>percent of margin</b> below the ${policyFor(today()).marginThresholdBps} bps threshold and as <b>basis points</b> at or above it; the chip on each row shows which applied.</p>
   </div>`;
   batchRows.forEach((_,i)=>updBatch(i));
+}
+function batchOpts(r,pol){
+  const lo=(r.lo||'').trim();
+  if(!lo) return {originator:'manager'};
+  const bps=parseFloat(r.bps)||0;
+  const mode=loCompModeFor(bps,pol);
+  const v=parseFloat(r.comp)||0;
+  return {originator:'lo',loName:lo,loCompMode:mode,loCompPct:mode==='pct'?v:0,loCompBps:mode==='bps'?v:0};
 }
 function updBatch(i){
   const r=batchRows[i]; if(!r) return;
   const cell=document.getElementById('b-net-'+i); if(!cell) return;
   const pol=policyFor(r.date||today());
-  const c=(r.amt&&r.bps!==undefined&&r.bps!=='')?calcLoan(toCents(r.amt)||0,parseFloat(r.bps)||0,toCents(r.fee)||0,pol):null;
+  const o=batchOpts(r,pol);
+  const c=(r.amt&&r.bps!==undefined&&r.bps!=='')?calcLoan(toCents(r.amt)||0,parseFloat(r.bps)||0,toCents(r.fee)||0,pol,o):null;
   const dupe=!!(r.ln&&dupLoan(r.ln));
-  cell.innerHTML=(c?fmt$(c.netCents):'\u2014')+(dupe?' <span class="chip c-gold">dupe</span>':'');
+  const needComp=o.originator==='lo'&&(r.comp===undefined||r.comp==='');
+  cell.innerHTML=(c?fmt$s(c.netCents):'\u2014')
+    +(dupe?' <span class="chip c-gold">dupe</span>':'')
+    +(needComp?' <span class="chip c-gold">comp?</span>':'')
+    +(o.originator==='lo'&&!needComp?' <span class="chip c-teal" style="font-size:.62rem">'+(o.loCompMode==='pct'?'%':'bps')+'</span>':'');
   const lnEl=document.getElementById('b-ln-'+i); if(lnEl) lnEl.classList.toggle('invalid',dupe);
 }
 function postBatch(){
@@ -2138,8 +2322,11 @@ function postBatch(){
   batchRows.forEach(r=>{
     if(!r.date||!r.ln||!r.borrower||!toCents(r.amt)||r.bps===undefined||r.bps===''){ if(Object.keys(r).length) skipped++; return; }
     if(dupLoan(r.ln)){ skipped++; return; }
-    const pol=policyFor(r.date); const c=calcLoan(toCents(r.amt),parseFloat(r.bps),toCents(r.fee)||0,pol);
-    const t=postTxn({branch:myBranch(),type:'loan',date:r.date,desc:'Funded loan \u00b7 '+r.borrower.trim()+' \u00b7 #'+r.ln.trim(),
+    const pol=policyFor(r.date); const o=batchOpts(r,pol);
+    if(o.originator==='lo'&&(r.comp===undefined||r.comp==='')){ skipped++; return; }
+    const c=calcLoan(toCents(r.amt),parseFloat(r.bps),toCents(r.fee)||0,pol,o);
+    const t=postTxn({branch:myBranch(),type:'loan',date:r.date,
+      desc:'Funded loan \u00b7 '+r.borrower.trim()+' \u00b7 #'+r.ln.trim()+(o.originator==='lo'?' \u00b7 LO '+o.loName:''),
       amountCents:c.netCents,createdBy:me.id,
       detail:{borrower:r.borrower.trim(),loanNumber:r.ln.trim(),loanAmountCents:toCents(r.amt),actualBps:parseFloat(r.bps),procFeeCents:toCents(r.fee)||0,...c}});
     postedIds.push(t.id); sessionPosts.unshift(t.id); postedNet+=c.netCents;
@@ -2445,20 +2632,31 @@ function renderAdmin(){
       <h3 style="margin:0 0 6px">Overage policy rules</h3>
       <p class="muted" style="margin:0 0 12px;font-size:.86rem">Effective-dated. New versions apply prospectively; every posted loan keeps the snapshot of the rule that priced it, so history never recalculates.</p>
       <table class="tbl">
-        <thead><tr><th>Version</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Processing baseline</th><th></th></tr></thead>
+        <thead><tr><th>Version</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Branch net (LP)</th><th class="num">Corp take (LP)</th><th class="num">Branch / corp (BP)</th><th class="num">Proc. baseline</th><th></th></tr></thead>
         <tbody>${pol.map(p=>`<tr>
           <td style="font-weight:700">${p.version}</td><td>${fmtDate(p.effectiveFrom)}</td>
-          <td class="num">${p.marginThresholdBps} bps</td><td class="num">${fmt$(p.procBaselineCents)}</td>
-          <td>${p.version===cur.version?'<span class="chip c-teal">In effect</span>':''}</td></tr>`).join('')}
+          <td class="num">${p.marginThresholdBps} bps</td>
+          <td class="num">${branchNetBpsOf(p)===null?'\u2014':branchNetBpsOf(p)+' bps'}</td>
+          <td class="num">${corpTakeBpsOf(p)===null?'\u2014':corpTakeBpsOf(p)+' bps'}</td>
+          <td class="num">${usesWaterfall(p)?branchTakePctOf(p)+'% / '+corpTakePctOf(p)+'%':'\u2014'}</td>
+          <td class="num">${fmt$(p.procBaselineCents)}</td>
+          <td>${p.version===cur.version?'<span class="chip c-teal">In effect</span>':'<span class="muted" style="font-size:.76rem">'+(usesWaterfall(p)?'':'legacy')+'</span>'}</td></tr>`).join('')}
         </tbody>
       </table>
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:16px">
         <div style="font-weight:700;font-size:.9rem;margin-bottom:10px">Publish new policy version</div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px">
-          <div class="fld"><label>Effective from</label><input id="polFrom" type="date" value="${today()}"></div>
-          <div class="fld"><label>Margin threshold (bps)</label><input id="polBps" type="number" step="0.1" value="${cur.marginThresholdBps}"></div>
+          <div class="fld"><label>Effective from</label><input id="polFrom" type="date" value="${today().slice(0,8)}01">
+            <div class="hint">Prices loans <b>funded on or after</b> this date. Defaults to the 1st of this month so loans already funded this month are covered. Back-date it further if you need to reprice earlier months.</div></div>
+          <div class="fld"><label>Margin threshold (bps)</label><input id="polBps" type="number" step="0.1" value="${cur.marginThresholdBps}"><div class="hint">At or above this, deals are lender paid (bps). Below it, borrower paid (percent).</div></div>
+          <div class="fld"><label>Branch net at threshold (bps)</label><input id="polNet" type="number" step="0.1" value="${branchNetBpsOf(cur)===null?225:branchNetBpsOf(cur)}" oninput="polPreview()"><div class="hint" id="polNetHint"></div></div>
           <div class="fld"><label>Processing baseline ($)</label><input id="polBase" type="number" step="0.01" value="${(cur.procBaselineCents/100).toFixed(2)}"></div>
+          <div class="fld"><label>Branch take, borrower paid (%)</label><input id="polTake" type="number" step="0.01" value="${branchTakePctOf(cur)}" oninput="polPreview()"><div class="hint" id="polTakeHint"></div></div>
         </div>
+        <div class="calc-box" style="margin-top:12px"><div class="kpi-label" style="margin-bottom:6px">The equation this publishes</div>
+          <div class="calc-line"><span>Total margin \u2212 corp take \u2212 LO comp</span><span><b>= net to branch P&amp;L</b></span></div>
+          <div class="calc-line" id="polPrevLP"></div>
+          <div class="calc-line" id="polPrevBP"></div></div>
         <div style="margin-top:12px"><button class="btn btn-primary btn-sm" onclick="addPolicy()">Publish version</button></div>
       </div>
     </div>
@@ -2500,6 +2698,7 @@ function renderAdmin(){
       </div>
     </div>
   </div>`;
+  polPreview();
   const rf=document.getElementById('restoreFile');
   if(rf) rf.addEventListener('change',restoreBackup);
   const sl=document.getElementById('admSyncLine'), sa=document.getElementById('admSyncActions');
@@ -2595,16 +2794,30 @@ function resetToCutover(){
     renderAll(); toast('Ledger reset to spreadsheet cutover','ok'); return true;
   });
 }
+function polPreview(){
+  const g=id=>document.getElementById(id); if(!g('polBps')) return;
+  const thr=parseFloat(g('polBps').value)||0, net=parseFloat(g('polNet').value)||0, take=parseFloat(g('polTake').value)||0;
+  const corpBps=Math.round((thr-net)*10)/10, corpPct=Math.round((100-take)*100)/100;
+  g('polNetHint').innerHTML='Implies a corp take of <b>'+corpBps+' bps</b> on lender-paid deals';
+  g('polTakeHint').innerHTML='Implies a corp take of <b>'+corpPct+'%</b> of margin on borrower-paid deals';
+  g('polPrevLP').innerHTML='<span>Lender paid (at or above '+thr+' bps)</span><span>corp '+corpBps+' bps \u00b7 branch nets '+net+' bps at threshold</span>';
+  g('polPrevBP').innerHTML='<span>Borrower paid (below '+thr+' bps)</span><span>corp '+corpPct+'% \u00b7 branch '+take+'% of margin</span>';
+}
 function addPolicy(){
   const from=document.getElementById('polFrom').value;
   const bps=parseFloat(document.getElementById('polBps').value);
   const base=toCents(document.getElementById('polBase').value);
+  const take=parseFloat(document.getElementById('polTake').value);
+  const net=parseFloat(document.getElementById('polNet').value);
   if(!from||isNaN(bps)||base===null){ toast('Effective date, threshold, and baseline are required','warn'); return; }
+  if(isNaN(net)){ toast('Enter the branch net at threshold, in basis points','warn'); return; }
   const v='R'+(S.policies.length+1);
-  confirmModal('Publish policy '+v+'?','From '+fmtDate(from)+', loans price against a '+bps+' bps margin threshold and a '+fmt$(base)+' processing baseline. Loans already posted keep their original rule snapshot.','Publish',()=>{
-    S.policies.push({version:v,effectiveFrom:from,marginThresholdBps:bps,procBaselineCents:base,note:'Published by '+me.name});
-    logAudit('admin','Published policy '+v+' \u00b7 '+bps+' bps / '+fmt$(base)+' effective '+fmtDate(from),null);
-    save(); renderAdmin(); toast('Policy '+v+' published, effective '+fmtDate(from),'ok');
+  confirmModal('Publish policy '+v+'?','From '+fmtDate(from)+', loans funded on or after that date price at a '+bps+' bps threshold. Lender paid: corp takes '+(Math.round((bps-net)*10)/10)+' bps, branch nets '+net+' bps at threshold. Borrower paid: branch '+(isNaN(take)?73:take)+'%, corp '+(Math.round((100-(isNaN(take)?73:take))*100)/100)+'%. Processing baseline '+fmt$(base)+'. Loans already posted keep their original rule snapshot.','Publish',()=>{
+    S.policies.push({version:v,effectiveFrom:from,marginThresholdBps:bps,procBaselineCents:base,
+      branchNetBps:net, branchTakePct:isNaN(take)?73:take, note:'Published by '+me.name});
+    logAudit('admin','Published policy '+v+' \u00b7 threshold '+bps+' bps \u00b7 branch net '+net+' bps \u00b7 branch '+(isNaN(take)?73:take)+'% borrower paid \u00b7 baseline '+fmt$(base)+' \u00b7 effective '+fmtDate(from),null);
+    save(); renderAdmin();
+    toast('Policy '+v+' published. It prices loans funded on or after '+fmtDate(from)+'; earlier loans keep their original rule.','ok');
   });
 }
 
