@@ -489,15 +489,17 @@ function defaultDB(){
     users:[
       {id:'u-janine', email:'janinet@partnersmortgage.com', name:'Janine Thomas', role:'finance', title:'Finance Operations', branches:['*'], color:'#00818D', init:'JT'},
       {id:'u-jason',  email:'jasonm@partnersmortgage.com', name:'Jason Malmstrom', role:'manager', title:'Branch Manager \u00b7 Malmstrom Group', branches:['malmstrom'], color:'#8A7E78', init:'JM'},
-      {id:'u-leif',   email:'lboyd@partnersmortgage.com', name:'Leif Boyd', role:'admin', title:'Administrator \u00b7 Senior Approver', branches:['*'], color:'#1F2A2D', init:'LB'}
+      {id:'u-leif',   email:'leifb@partnersmortgage.com', name:'Leif Boyd', role:'admin', title:'President \u00b7 Administrator', branches:['*'], color:'#1F2A2D', init:'LB'},
+      {id:'u-sam',    email:'sam@arborfg.com', name:'Sam Pavoni', role:'approver', title:'Approver', branches:['*'], color:'#5B7A8A', init:'SP', pending:true, uid:null},
+      {id:'u-david',  email:'david@arborfg.com', name:'David Arvidson', role:'admin', title:'Administrator', branches:['*'], color:'#A3672E', init:'DA', pending:true, uid:null}
     ],
     branches:[ {id:'malmstrom', name:'Malmstrom Group', city:'Roseville, CA', manager:'u-jason'} ],
     policies:[
       {version:'R1', effectiveFrom:'2000-01-01', marginThresholdBps:275, procBaselineCents:79500, note:'Legacy spreadsheet rule \u00b7 branch keeps margin above threshold'}
     ],
     approvalTiers:[
-      {maxCents:100000, approvers:['finance'], label:'Up to $1,000: Finance Operations'},
-      {maxCents:null,   approvers:['finance','admin'], label:'Over $1,000: Finance Operations + Administrator'}
+      {maxCents:100000, approvers:['finance','approver','admin'], label:'Up to $1,000: Finance Operations, Approver, or Administrator'},
+      {maxCents:null,   approvers:['approver','admin'], label:'Over $1,000: Approver or Administrator'}
     ],
     recurring:[
       {id:'rc-rent', branch:'malmstrom', name:'Office rent', category:'Rent', amountCents:169500, dayOfMonth:1, effectiveFrom:'2025-05-01', effectiveTo:null, active:true, lastGenerated:'2026-05'}
@@ -806,10 +808,18 @@ function initialsFrom(name,email){
    saved by earlier versions that had no email field, so a known person always
    lands on their real role instead of becoming a new pending account. */
 const SEED_IDENTITY={
-  'u-janine':{email:'janinet@partnersmortgage.com', name:'Janine Thomas', role:'finance', branches:['*'], title:'Finance Operations', init:'JT', color:'#00818D'},
-  'u-jason' :{email:'jasonm@partnersmortgage.com',  name:'Jason Malmstrom', role:'manager', branches:['malmstrom'], title:'Branch Manager \u00b7 Malmstrom Group', init:'JM', color:'#8A7E78'},
-  'u-leif'  :{email:'lboyd@partnersmortgage.com',   name:'Leif Boyd', role:'admin', branches:['*'], title:'Administrator \u00b7 Senior Approver', init:'LB', color:'#1F2A2D'}
+  'u-janine':{email:'janinet@partnersmortgage.com', aliases:['jthomas@partnersmortgage.com','janine@partnersmortgage.com'], name:'Janine Thomas', role:'finance', branches:['*'], title:'Finance Operations', init:'JT', color:'#00818D'},
+  'u-jason' :{email:'jasonm@partnersmortgage.com',  aliases:['jmalmstrom@partnersmortgage.com','jason@partnersmortgage.com'], name:'Jason Malmstrom', role:'manager', branches:['malmstrom'], title:'Branch Manager \u00b7 Malmstrom Group', init:'JM', color:'#8A7E78'},
+  'u-leif'  :{email:'leifb@partnersmortgage.com',   aliases:['lboyd@partnersmortgage.com','leif@partnersmortgage.com'], name:'Leif Boyd', role:'admin', branches:['*'], title:'President \u00b7 Administrator', init:'LB', color:'#1F2A2D'},
+  'u-sam'   :{email:'sam@arborfg.com',   aliases:['spavoni@arborfg.com','samp@arborfg.com','sam@partnersmortgage.com','samp@partnersmortgage.com'], name:'Sam Pavoni', role:'approver', branches:['*'], title:'Approver', init:'SP', color:'#5B7A8A'},
+  'u-david' :{email:'david@arborfg.com', aliases:['dave@arborfg.com','darvidson@arborfg.com','davida@arborfg.com','david@partnersmortgage.com','davida@partnersmortgage.com'], name:'David Arvidson', role:'admin', branches:['*'], title:'Administrator', init:'DA', color:'#A3672E'}
 };
+function identityFor(email){
+  const e=(email||'').toLowerCase();
+  const hit=Object.entries(SEED_IDENTITY).find(([,v])=>
+    v.email.toLowerCase()===e || (v.aliases||[]).some(a=>a.toLowerCase()===e));
+  return hit?{id:hit[0],...hit[1]}:null;
+}
 function migrateUsers(){
   let changed=false, notes=[];
   /* 1. backfill fields missing from records written by earlier versions */
@@ -817,7 +827,7 @@ function migrateUsers(){
     const seed=SEED_IDENTITY[u.id];
     if(seed){
       if(!u.email){ u.email=seed.email; changed=true; notes.push('email restored for '+seed.name); }
-      if(!u.role||u.role!==seed.role){ u.role=seed.role; changed=true; }
+      if(!u.role){ u.role=seed.role; changed=true; }
       if(!Array.isArray(u.branches)||!u.branches.length){ u.branches=seed.branches.slice(); changed=true; }
       if(!u.init) u.init=seed.init;
       if(!u.color) u.color=seed.color;
@@ -826,9 +836,15 @@ function migrateUsers(){
     if(u.pending===undefined){ u.pending=!u.branches.length; changed=true; }
     if(u.uid===undefined){ u.uid=null; changed=true; }
   });
-  /* 2. collapse duplicate accounts that share an email (created when matching failed) */
+  /* 2. collapse duplicates. Group by identity where we can recognise one, so an
+        account created under an alias address still merges into the real seat. */
   const byEmail={};
-  S.users.forEach(u=>{ const e=(u.email||'').toLowerCase(); if(!e) return; (byEmail[e]=byEmail[e]||[]).push(u); });
+  S.users.forEach(u=>{
+    const e=(u.email||'').toLowerCase(); if(!e) return;
+    const ident=identityFor(e);
+    const key=ident?('id:'+ident.id):('em:'+e);
+    (byEmail[key]=byEmail[key]||[]).push(u);
+  });
   Object.entries(byEmail).forEach(([e,list])=>{
     if(list.length<2) return;
     const rank=u=>(SEED_IDENTITY[u.id]?4:0)+(u.pending?0:2)+(ubr(u).length?1:0);
@@ -836,6 +852,7 @@ function migrateUsers(){
     const keep=list[0];
     list.slice(1).forEach(dup=>{
       if(dup.uid&&!keep.uid) keep.uid=dup.uid;
+      if(dup.email&&SEED_IDENTITY[keep.id]) keep.email=dup.email;  /* remember the address they actually use */
       S.branches.forEach(b=>{ if(b.manager===dup.id) b.manager=keep.id; });
       S.transactions.forEach(t=>{ if(t.createdBy===dup.id) t.createdBy=keep.id; });
       S.requests.forEach(r=>{ if(r.createdBy===dup.id) r.createdBy=keep.id; });
@@ -850,6 +867,15 @@ function resolveAppUser(){
   migrateUsers();
   const email=(authUser.email||'').toLowerCase();
   let u=S.users.find(x=>(x.email||'').toLowerCase()===email);
+  if(!u){
+    /* signed in with a known alias: claim that seat and record the address actually used */
+    const ident=identityFor(email);
+    if(ident){
+      u=S.users.find(x=>x.id===ident.id);
+      if(!u){ u={id:ident.id,name:ident.name,role:ident.role,title:ident.title,branches:ident.branches.slice(),color:ident.color,init:ident.init,pending:false,uid:null}; S.users.push(u); }
+      u.email=authUser.email; u.pending=false; save();
+    }
+  }
   if(u){
     const wasPending=u.pending;
     u.uid=authUser.uid;
@@ -901,21 +927,22 @@ function resetDemo(){
    SHELL: personas, nav, routing
    ===================================================================== */
 const NAV=[
-  {id:'dashboard', label:'Command Center', ic:'\u25A6', roles:['manager','finance','admin']},
-  {id:'ledger',    label:'Branch Ledger', ic:'\u2630', roles:['manager','finance','admin']},
-  {id:'pl',        label:'Internal P&L', ic:'\u03A3', roles:['manager','finance','admin']},
-  {id:'statements',label:'Statements', ic:'\u29C9', roles:['manager','finance','admin']},
-  {id:'requests',  label:'Requests & Approvals', ic:'\u2709', roles:['manager','finance','admin'], badge:true},
+  {id:'dashboard', label:'Command Center', ic:'\u25A6', roles:['manager','finance','admin','approver']},
+  {id:'ledger',    label:'Branch Ledger', ic:'\u2630', roles:['manager','finance','admin','approver']},
+  {id:'pl',        label:'Internal P&L', ic:'\u03A3', roles:['manager','finance','admin','approver']},
+  {id:'statements',label:'Statements', ic:'\u29C9', roles:['manager','finance','admin','approver']},
+  {id:'requests',  label:'Requests & Approvals', ic:'\u2709', roles:['manager','finance','admin','approver'], badge:true},
   {id:'newrequest',label:'New Disbursement', ic:'+', roles:['manager','finance','admin']},
   {sec:'Finance Operations'},
   {id:'entry',     label:'Transaction Entry', ic:'\u270E', roles:['finance','admin']},
   {id:'import',    label:'Import Ledger', ic:'\u21E9', roles:['finance','admin']},
   {id:'recurring', label:'Recurring Charges', ic:'\u21BB', roles:['finance','admin']},
   {sec:'Controls'},
-  {id:'recon',     label:'Reconciliation', ic:'\u2696', roles:['finance','admin']},
-  {id:'audit',     label:'Audit Log', ic:'\u2637', roles:['finance','admin']},
+  {id:'recon',     label:'Reconciliation', ic:'\u2696', roles:['finance','admin','approver']},
+  {id:'audit',     label:'Audit Log', ic:'\u2637', roles:['finance','admin','approver']},
   {id:'admin',     label:'Administration', ic:'\u2699', roles:['admin','finance']}
 ];
+const ROLE_LABEL={manager:'Branch Manager',finance:'Finance Operations',approver:'Approver',admin:'Administrator'};
 const VIEW_TITLES={dashboard:'Branch Financial Command Center',ledger:'Branch Ledger',pl:'Internal Management P&L',
   statements:'Monthly Statements',requests:'Requests & Approvals',newrequest:'New Disbursement Request',
   entry:'Transaction Entry Workspace',import:'Import Ledger Data',recurring:'Recurring Charges',
@@ -929,7 +956,7 @@ function sendFeedback(){
   const br=S.branches.find(x=>x.id===myBranch());
   const subject='BFCC Feedback \u00b7 '+(VIEW_TITLES[curView]||'General')+' \u00b7 '+(br?br.name:'');
   const body='Screen: '+(VIEW_TITLES[curView]||curView)+'%0D%0ABranch: '+(br?br.name:'')+'%0D%0AViewing as: '+(me?me.name:'')+'%0D%0A%0D%0AWhat works:%0D%0A%0D%0AWhat is confusing:%0D%0A%0D%0AWhat is missing:%0D%0A';
-  const addr=['lboyd','partnersmortgage.com'].join(String.fromCharCode(64));
+  const addr=['leifb','partnersmortgage.com'].join(String.fromCharCode(64));
   window.location.href='mailto:'+addr+'?subject='+encodeURIComponent(subject)+'&body='+body;
 }
 
@@ -1090,7 +1117,7 @@ function renderAll(){
   }
   const av=document.getElementById('tbAvatar'); av.textContent=me.init; av.style.background=me.color;
   document.getElementById('tbName').textContent=me.name;
-  const roleLabel={manager:'Branch Manager',finance:'Finance Operations',admin:'Administrator'}[me.role]||'';
+  const roleLabel=ROLE_LABEL[me.role]||'';
   const trEl=document.getElementById('tbRole'); if(trEl) trEl.textContent=roleLabel;
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
   const el=document.getElementById('v-'+curView); el.classList.add('on');
@@ -2679,20 +2706,40 @@ function renderAdmin(){
       <h3 style="margin:0 0 12px">Approval routing</h3>
       ${S.approvalTiers.map(t=>`<div class="check-row"><div class="cico" style="background:var(--teal-soft);color:var(--teal)">\u2713</div>
         <div><div class="ct">${esc(t.label)}</div><div class="cd">Separation of duties enforced: a requester can never approve their own request.</div></div></div>`).join('')}
+      <table class="tbl" style="margin-top:12px">
+        <thead><tr><th>Role</th><th>Can do</th></tr></thead>
+        <tbody>
+          <tr><td style="font-weight:600">Branch Manager</td><td>Sees one branch. Creates and submits disbursement requests. Cannot post ledger entries.</td></tr>
+          <tr><td style="font-weight:600">Finance Operations</td><td>All branches. Posts entries, imports, generates rent, marks requests paid, adds branches and people.</td></tr>
+          <tr><td style="font-weight:600">Approver</td><td>All branches. Reviews and approves requests at every tier, and sees reports, reconciliation, and the audit log. Cannot post entries or change settings.</td></tr>
+          <tr><td style="font-weight:600">Administrator</td><td>Everything, including publishing policy rules and managing access.</td></tr>
+        </tbody>
+      </table>
       <h3 style="margin:18px 0 6px">Users &amp; access</h3>
       <p class="muted" style="font-size:.82rem;margin:0 0 10px">Assign each person a role and the branch they can see. New sign-ups appear here marked <span class="chip c-gold" style="font-size:.68rem">Pending</span> until you assign them. Changes sync to that person's screen within seconds.</p>
       <table class="tbl"><thead><tr><th>Name / email</th><th>Role</th><th>Branch access</th></tr></thead>
       <tbody>${[...S.users].sort((a,b)=>(b.pending?1:0)-(a.pending?1:0)).map(u=>{
-        const roleOpts=[['manager','Branch Manager'],['finance','Finance Operations'],['admin','Administrator']].map(([v,l])=>`<option value="${v}" ${u.role===v?'selected':''}>${l}</option>`).join('');
+        const roleOpts=Object.entries(ROLE_LABEL).map(([v,l])=>`<option value="${v}" ${u.role===v?'selected':''}>${l}</option>`).join('');
         const branchVal=ubr(u)[0]==='*'?'*':(ubr(u)[0]||'');
         const branchOpts=`<option value="" ${!branchVal?'selected':''}>Not assigned</option><option value="*" ${branchVal==='*'?'selected':''}>All branches (Finance/Admin)</option>`+S.branches.map(b=>`<option value="${b.id}" ${branchVal===b.id?'selected':''}>${esc(b.name)}</option>`).join('');
         const self=u.id===me.id;
         return `<tr>
-          <td style="font-weight:600">${esc(u.name)}${u.pending?' <span class="chip c-gold" style="font-size:.68rem">Pending</span>':''}${self?' <span class="chip c-gray" style="font-size:.68rem">you</span>':''}<div class="muted" style="font-size:.76rem;font-weight:400">${esc(u.email||'no email on file')}</div></td>
+          <td style="font-weight:600">${esc(u.name)}${u.pending?(ubr(u).length?' <span class="chip c-gold" style="font-size:.68rem">Not registered</span>':' <span class="chip c-gold" style="font-size:.68rem">Pending</span>'):''}${self?' <span class="chip c-gray" style="font-size:.68rem">you</span>':''}<input type="email" value="${esc(u.email||'')}" placeholder="no email on file" onchange="setUserEmail('${u.id}',this.value)" style="border:1px solid transparent;border-radius:6px;padding:2px 4px;font-size:.76rem;font-weight:400;color:var(--gray);width:100%;background:transparent;font-family:inherit" onfocus="this.style.borderColor='var(--line)';this.style.background='#fff'" onblur="this.style.borderColor='transparent';this.style.background='transparent'"></td>
           <td><select class="branch-switch" ${self?'disabled':''} onchange="setUserRole('${u.id}',this.value)">${roleOpts}</select></td>
           <td><select class="branch-switch" ${self?'disabled':''} onchange="setUserBranch('${u.id}',this.value)">${branchOpts}</select></td>
         </tr>`;
       }).join('')}</tbody></table>
+      <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:14px">
+        <div style="font-weight:700;font-size:.9rem;margin-bottom:4px">Add a person</div>
+        <p class="muted" style="font-size:.82rem;margin:0 0 10px">Set someone up before they sign in. They register themselves with the email you enter here and land in the right role automatically.</p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px">
+          <div class="fld"><label>Full name</label><input id="np-name" placeholder="e.g. Sam Pavoni"></div>
+          <div class="fld"><label>Work email</label><input id="np-email" type="email" placeholder="name@partnersmortgage.com"></div>
+          <div class="fld"><label>Role</label><select id="np-role">${Object.entries(ROLE_LABEL).map(([v,l])=>`<option value="${v}" ${v==='approver'?'selected':''}>${l}</option>`).join('')}</select></div>
+          <div class="fld"><label>Branch (managers only)</label><select id="np-branch"><option value="">All branches</option>${S.branches.map(b=>`<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></div>
+        </div>
+        <div style="margin-top:10px"><button class="btn btn-primary btn-sm" onclick="addPerson()">Add person</button></div>
+      </div>
       <h3 style="margin:18px 0 6px">Branches</h3>
       <p class="muted" style="font-size:.82rem;margin:0 0 10px">To create a new branch, use the <b>Add a branch</b> panel at the top of this screen.</p>
       <table class="tbl"><thead><tr><th>Branch</th><th>Location</th><th>Manager</th></tr></thead>
@@ -2723,21 +2770,51 @@ function renderAdmin(){
   if(sa) sa.innerHTML='<span class="muted" style="font-size:.8rem">Signed in as '+esc(authUser?authUser.email:(me?me.email:''))+'</span>';
 }
 function slugId(name){ return name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||('b'+Date.now()); }
-function clearPendingIfAssigned(u){ if(!Array.isArray(u.branches)) u.branches=[]; if(u.branches.length && u.pending){ u.pending=false; if(u.title==='Pending access') u.title=(u.role==='manager'?'Branch Manager':u.role==='finance'?'Finance Operations':'Administrator'); } }
+function clearPendingIfAssigned(u){ if(!Array.isArray(u.branches)) u.branches=[]; if(u.branches.length && u.pending){ u.pending=false; if(u.title==='Pending access') u.title=ROLE_LABEL[u.role]||'Team member'; } }
+function setUserEmail(uid,val){
+  const u=S.users.find(x=>x.id===uid); if(!u) return;
+  const e=(val||'').trim().toLowerCase();
+  if(e&&!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)){ toast('That does not look like an email address','warn'); renderAdmin(); return; }
+  if(e&&S.users.some(x=>x.id!==uid&&(x.email||'').toLowerCase()===e)){ toast('Another person already uses that address','warn'); renderAdmin(); return; }
+  const was=u.email||'(none)';
+  u.email=e||null;
+  if(u.uid&&e&&was.toLowerCase()!==e) u.uid=null;   /* address changed: they re-claim on next sign in */
+  logAudit('access','Email set \u00b7 '+u.name+' \u00b7 '+was+' \u2192 '+(e||'(none)'),null);
+  save(); renderAdmin(); toast(u.name+' will sign in with '+(e||'no address on file'),'ok');
+}
+function addPerson(){
+  const g=id=>document.getElementById(id);
+  const name=(g('np-name').value||'').trim();
+  const email=(g('np-email').value||'').trim().toLowerCase();
+  const role=g('np-role').value;
+  const branch=g('np-branch').value;
+  if(!name||!email){ toast('Name and work email are required','warn'); return; }
+  if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ toast('Enter a valid email address','warn'); return; }
+  if(S.users.some(u=>(u.email||'').toLowerCase()===email)){ toast('Someone already uses that address','warn'); return; }
+  if(role==='manager'&&!branch){ toast('Pick the branch this manager will see','warn'); return; }
+  const parts=name.split(/\s+/);
+  const init=((parts[0][0]||'')+(parts[1]?parts[1][0]:'')).toUpperCase();
+  let id='u-'+slugId(name); if(S.users.some(u=>u.id===id)) id=id+'-'+(S.users.length+1);
+  S.users.push({id,email,name,role,title:ROLE_LABEL[role]||'Team member',
+    branches:role==='manager'?[branch]:['*'], color:'#5B7A8A', init, pending:true, uid:null});
+  logAudit('access','Person added \u00b7 '+name+' ('+email+') \u00b7 '+(ROLE_LABEL[role]||role)+' \u00b7 '+(role==='manager'?branch:'all branches'),null);
+  save(); renderAdmin();
+  toast(name+' is set up. They gain access by registering with '+email+'.','ok');
+}
 function setUserRole(uid,role){
   const u=S.users.find(x=>x.id===uid); if(!u) return;
   u.role=role;
-  if(role!=='manager') u.branches=['*'];
-  else if(ubr(u)[0]==='*') u.branches=[];
+  if(role!=='manager'){ u.branches=['*']; }
+  else if(ubr(u)[0]==='*'){ u.branches=[]; }
   clearPendingIfAssigned(u);
   logAudit('access','Role set \u00b7 '+u.name+' \u2192 '+role,null);
-  save(); renderAdmin(); toast(u.name+' is now '+({manager:'a Branch Manager',finance:'Finance Operations',admin:'an Administrator'}[role]),'ok');
+  save(); renderAdmin(); toast(u.name+' is now '+(ROLE_LABEL[role]||role),'ok');
 }
 function setUserBranch(uid,val){
   const u=S.users.find(x=>x.id===uid); if(!u) return;
   if(val==='*'){ u.branches=['*']; if(u.role==='manager') u.role='finance'; }
   else if(val===''){ u.branches=[]; }
-  else { u.branches=[val]; if(u.role!=='manager'&&u.role!=='admin') u.role='manager'; }
+  else { u.branches=[val]; if(u.role==='finance') u.role='manager'; }
   clearPendingIfAssigned(u);
   const label=val==='*'?'all branches':(val?((S.branches.find(b=>b.id===val)||{}).name):'no branch');
   logAudit('access','Branch access set \u00b7 '+u.name+' \u2192 '+label,null);
