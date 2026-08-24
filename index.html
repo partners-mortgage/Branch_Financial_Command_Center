@@ -386,7 +386,7 @@ footer.appfoot .ym{font-family:'Lora',serif;font-style:italic;color:var(--teal);
     <footer class="appfoot">
       <div class="ym">You matter.</div>
       Partners Mortgage &middot; 1687 Eureka Road, Suite 100, Roseville, CA 95661 &middot; (916) 270-9088<br>
-      Branch Financial Command Center &middot; Internal prototype with sample data
+      Branch Financial Command Center
     </footer>
   </div>
 </div>
@@ -495,7 +495,7 @@ function defaultDB(){
     ],
     branches:[ {id:'malmstrom', name:'Malmstrom Group', city:'Roseville, CA', manager:'u-jason'} ],
     policies:[
-      {version:'R1', effectiveFrom:'2000-01-01', marginThresholdBps:275, procBaselineCents:79500, note:'Legacy spreadsheet rule \u00b7 branch keeps margin above threshold'}
+      {id:'pol-r1', branch:null, version:'R1', effectiveFrom:'2000-01-01', marginThresholdBps:275, procBaselineCents:79500, note:'Legacy spreadsheet rule \u00b7 branch keeps margin above threshold'}
     ],
     approvalTiers:[
       {maxCents:100000, approvers:['finance','approver','admin'], label:'Up to $1,000: Finance Operations, Approver, or Administrator'},
@@ -511,9 +511,25 @@ function defaultDB(){
 }
 
 /* ---------- policy engine ---------- */
-function policyFor(dateStr){
-  const eligible=S.policies.filter(p=>p.effectiveFrom<=dateStr).sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom));
-  return eligible[0]||S.policies[0];
+/* A branch-specific rule always beats a company-wide one for that branch, and stays
+   in force until that branch gets a newer rule of its own. Publishing for one branch
+   never touches another. */
+function policyFor(dateStr, branchId){
+  const b=branchId||(typeof myBranch==='function'?myBranch():null);
+  const eligible=S.policies.filter(p=>p.effectiveFrom<=dateStr);
+  const mine=eligible.filter(p=>p.branch===b).sort((a,b2)=>b2.effectiveFrom.localeCompare(a.effectiveFrom));
+  if(mine.length) return mine[0];
+  const global=eligible.filter(p=>!p.branch).sort((a,b2)=>b2.effectiveFrom.localeCompare(a.effectiveFrom));
+  return global[0]||S.policies[0];
+}
+function policyScopeLabel(p){
+  if(!p.branch) return 'All branches';
+  const b=S.branches.find(x=>x.id===p.branch);
+  return b?b.name:p.branch;
+}
+function policiesVisibleHere(){
+  const b=myBranch();
+  return S.policies.filter(p=>!p.branch||p.branch===b);
 }
 /* Which compensation basis applies: below the margin threshold a loan officer is
    paid a percentage of the margin earned; at or above it they are paid in bps. */
@@ -680,7 +696,7 @@ function seedDB(){
   events.sort((a,b)=>a.date.localeCompare(b.date));
   events.forEach(e=>{
     if(e.kind==='loan'){
-      const pol=policyFor(e.date);
+      const pol=policyFor(e.date,'malmstrom');
       const c=calcLoan(e.amt,e.bps,e.fee,pol);
       postTxn({branch:'malmstrom',type:'loan',date:e.date,
         desc:'Funded loan \u00b7 '+e.borrower+' \u00b7 #'+e.ln,
@@ -699,6 +715,39 @@ function seedDB(){
 }
 
 function save(){ store.set(DB_KEY, JSON.stringify(S)); fbPush(); }
+
+/* ---------- document store ----------
+   Attachments live in their own Firebase node and their own local cache. They are
+   deliberately NOT part of the synced database payload: that payload is rewritten
+   on every save, and folding megabytes of PDF into it would slow every edit for
+   everyone. Requests carry only the metadata. */
+const DOCS_KEY='pm_bfcc_docs_v1';
+const MAX_DOC_BYTES=3*1024*1024;
+let fbDocs=null;
+function fmtBytes(n){ if(!n&&n!==0) return ''; if(n<1024) return n+' B'; if(n<1024*1024) return (n/1024).toFixed(0)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
+function docCacheGet(){ try{ return JSON.parse(store.get(DOCS_KEY)||'{}'); }catch(e){ return {}; } }
+function docCacheSet(m){ try{ store.set(DOCS_KEY, JSON.stringify(m)); }catch(e){ /* local quota full; Firebase still holds it */ } }
+function saveDocPayload(id, dataUrl){
+  const m=docCacheGet(); m[id]=dataUrl; docCacheSet(m);
+  if(fbDocs) return fbDocs.child(id).set(dataUrl);
+  return Promise.resolve();
+}
+function loadDocPayload(id){
+  const m=docCacheGet();
+  if(m[id]) return Promise.resolve(m[id]);
+  if(fbDocs) return fbDocs.child(id).get().then(s=>{ const v=s.val(); if(v){ const mm=docCacheGet(); mm[id]=v; docCacheSet(mm); } return v; });
+  return Promise.resolve(null);
+}
+function openDoc(id, name){
+  loadDocPayload(id).then(v=>{
+    if(!v){ toast('That file has not reached this device yet. Try again in a moment.','warn'); return; }
+    const a=document.createElement('a'); a.href=v; a.download=name||'document';
+    document.body.appendChild(a); a.click(); a.remove();
+  }).catch(()=>toast('Could not open that file','err'));
+}
+function readFileAsDataUrl(f){
+  return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(new Error('read failed')); r.readAsDataURL(f); });
+}
 
 /* ---------- sync engine ---------- */
 let fbRoot=null, syncState='local', lastRev=null;
@@ -720,7 +769,7 @@ function packDB(s){
     meta:{schema:1, updatedAt:nowISO(), rev:uid('rev')+Math.random().toString(36).slice(2,8)},
     seq:s.seq,
     users:key(s.users,'id'), branches:key(s.branches,'id'),
-    policies:key(s.policies,'version'), recurring:key(s.recurring,'id'),
+    policies:key(s.policies.map(p=>({...p,id:p.id||('pol-'+p.version)})),'id'), recurring:key(s.recurring,'id'),
     approvalTiers:(s.approvalTiers||[]).reduce((o,t,i)=>{o['t'+i]=t;return o;},{}),
     tx:key(s.transactions,'id'), requests:key(s.requests,'id'), audit:key(s.audit,'id')
   }));
@@ -730,7 +779,7 @@ function unpackDB(r){
   return {
     seq:{txn:(r.seq&&r.seq.txn)||0, req:(r.seq&&r.seq.req)||0},
     users:arr(r.users).map(u=>({email:null,pending:false,uid:null,...u,branches:Array.isArray(u.branches)?u.branches:[]})), branches:arr(r.branches),
-    policies:arr(r.policies).sort((a,b)=>a.effectiveFrom.localeCompare(b.effectiveFrom)),
+    policies:arr(r.policies).map(p=>({branch:null,id:p.id||('pol-'+p.version),...p,branch:(p.branch===undefined?null:p.branch)})).sort((a,b)=>a.effectiveFrom.localeCompare(b.effectiveFrom)),
     recurring:arr(r.recurring).map(x=>({effectiveTo:null,lastGenerated:null,...x})),
     approvalTiers:Object.keys(r.approvalTiers||{}).sort().map(k=>({maxCents:null,...r.approvalTiers[k]})),
     transactions:arr(r.tx).map(t=>({detail:null,requestId:null,reverses:null,reversedBy:null,...t}))
@@ -783,6 +832,7 @@ function onAuthChanged(user){
 function connectDatabase(){
   setSync('connecting');
   fbRoot=firebase.database().ref('bfcc');
+  fbDocs=firebase.database().ref('bfcc_docs');
   fbRoot.get()
     .then(snap=>{
       const raw=snap.val();
@@ -1872,7 +1922,7 @@ function openReq(id){
     </div>
     <div style="margin-top:16px">
       <div class="kpi-label" style="margin-bottom:8px">Documentation</div>
-      ${r.docs.length?r.docs.map(d=>`<div style="display:flex;gap:8px;font-size:.87rem;padding:6px 0;border-bottom:1px solid var(--line-soft)"><span>\u{1F4CE}</span><b>${esc(d.name)}</b><span class="muted">${esc(d.note||'')}</span></div>`).join(''):'<div class="muted" style="font-size:.85rem">No documents attached. A note was accepted in place of documentation.</div>'}
+      ${r.docs.length?r.docs.map(d=>`<div style="display:flex;gap:8px;align-items:center;font-size:.87rem;padding:6px 0;border-bottom:1px solid var(--line-soft)"><span>\u{1F4CE}</span><b>${esc(d.name)}</b>${d.size?`<span class="muted">${fmtBytes(d.size)}</span>`:''}<span class="muted">${esc(d.note||'')}</span><span style="flex:1"></span>${d.id?`<button class="btn btn-quiet btn-sm" onclick="openDoc('${d.id}','${esc(d.name)}')">Open</button>`:'<span class="muted" style="font-size:.78rem">name only</span>'}</div>`).join(''):'<div class="muted" style="font-size:.85rem">No documents attached. A note was accepted in place of documentation.</div>'}
     </div>
     <div style="margin-top:18px">
       <div class="kpi-label" style="margin-bottom:10px">Timeline \u00b7 who, what, when</div>
@@ -1967,6 +2017,11 @@ function printRequest(id){
       <tr><td><b>Purpose</b></td><td colspan="3">${esc(r.purpose)}</td></tr>
       ${r.paidTxnId?`<tr><td><b>Linked ledger debit</b></td><td colspan="3">${r.paidTxnId}</td></tr>`:''}
     </tbody></table>
+    <h3 style="margin:16px 0 6px;font-size:.95rem">Documentation</h3>
+    ${r.docs.length?`<table class="pr-tbl"><thead><tr><th>File</th><th>Size</th><th>Note</th></tr></thead>
+    <tbody>${r.docs.map(dc=>`<tr><td>${esc(dc.name)}</td><td>${dc.size?fmtBytes(dc.size):'\u2014'}</td><td>${esc(dc.note||'')}</td></tr>`).join('')}</tbody></table>
+    <p class="pr-note">Files are stored with the request in the Command Center. This printout lists them; open the request to retrieve them.</p>`
+    :`<p style="font-size:.85rem">No documents attached.${r.docNote?' Reason given: '+esc(r.docNote):''}</p>`}
     <h3 style="margin:16px 0 6px;font-size:.95rem">Audit timeline</h3>
     <table class="pr-tbl"><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Note</th></tr></thead>
     <tbody>${r.timeline.map(ev=>`<tr><td>${fmtDT(ev.at)}</td><td>${esc(ev.who)}</td><td>${esc(ev.action)}</td><td>${esc(ev.note||'')}</td></tr>`).join('')}</tbody></table>
@@ -2008,11 +2063,13 @@ function renderNewRequest(){
   if(wiz.step===2){
     body=`<p style="font-size:.9rem;color:var(--ink-soft);margin-bottom:14px">Attach an invoice, receipt, quote, or other support. If nothing applies, leave a note explaining why.</p>
     <div class="frow f2">
-      <div class="fld"><label>Attach document (prototype: name only)</label><input type="text" id="w-docname" placeholder="e.g. vendor-invoice-1042.pdf"></div>
-      <div class="fld"><label>Document note</label><input type="text" id="w-docnote" placeholder="e.g. Signed quote from vendor"></div>
+      <div class="fld"><label>Document note (optional)</label><input type="text" id="w-docnote" placeholder="e.g. Signed quote from vendor"></div>
+      <div class="fld"><label>Attach file</label>
+        <input type="file" id="w-docfile" multiple accept=".pdf,.jpg,.jpeg,.png,.heic,.doc,.docx,.xls,.xlsx,.csv,.txt" style="display:none" onchange="wizPickFiles(this)">
+        <button class="btn btn-quiet" style="width:100%" onclick="document.getElementById('w-docfile').click()">Choose file\u2026</button>
+        <div class="hint">PDF, image, or document up to ${fmtBytes(MAX_DOC_BYTES)}. Pick several at once if you need to.</div></div>
     </div>
-    <button class="btn btn-quiet btn-sm" onclick="wizAddDoc()">+ Add document</button>
-    <div style="margin-top:14px">${d.docs.length?d.docs.map((doc,i)=>`<div style="display:flex;gap:8px;align-items:center;font-size:.88rem;padding:7px 0;border-bottom:1px solid var(--line-soft)"><span>\u{1F4CE}</span><b>${esc(doc.name)}</b><span class="muted">${esc(doc.note||'')}</span><span style="flex:1"></span><button class="btn btn-quiet btn-sm" onclick="wiz.data.docs.splice(${i},1);renderNewRequest()">Remove</button></div>`).join(''):'<div class="muted" style="font-size:.86rem">No documents attached yet.</div>'}</div>
+    <div style="margin-top:14px">${d.docs.length?d.docs.map((doc,i)=>`<div style="display:flex;gap:8px;align-items:center;font-size:.88rem;padding:7px 0;border-bottom:1px solid var(--line-soft)"><span>\u{1F4CE}</span><b>${esc(doc.name)}</b>${doc.size?`<span class="muted">${fmtBytes(doc.size)}</span>`:''}<span class="muted">${esc(doc.note||'')}</span><span style="flex:1"></span>${doc.id?`<button class="btn btn-quiet btn-sm" onclick="openDoc('${doc.id}','${esc(doc.name)}')">Open</button>`:''}<button class="btn btn-quiet btn-sm" onclick="wiz.data.docs.splice(${i},1);renderNewRequest()">Remove</button></div>`).join(''):'<div class="muted" style="font-size:.86rem">No documents attached yet.</div>'}</div>
     <div class="frow" style="margin-top:16px"><div class="fld"><label>Note if no document is required</label><input type="text" id="w-nodoc" value="${esc(d.docNote)}" placeholder="Optional when a document is attached"></div></div>`;
   }
   if(wiz.step===3){
@@ -2073,11 +2130,26 @@ function wizCapture(){
   if(wiz.step===2){ const nd=document.getElementById('w-nodoc'); if(nd) wiz.data.docNote=nd.value; }
   if(wiz.step===4){ const c=document.getElementById('w-cert'); if(c) wiz.data.certified=c.checked; }
 }
-function wizAddDoc(){
-  const n=document.getElementById('w-docname').value.trim();
-  if(!n){ toast('Enter a document name','warn'); return; }
-  wiz.data.docs.push({name:n,note:document.getElementById('w-docnote').value.trim()});
-  wizCapture(); renderNewRequest();
+function wizPickFiles(input){
+  const files=[...(input.files||[])];
+  if(!files.length) return;
+  const note=(document.getElementById('w-docnote')||{}).value||'';
+  wizCapture();
+  const tooBig=files.filter(f=>f.size>MAX_DOC_BYTES);
+  const ok=files.filter(f=>f.size<=MAX_DOC_BYTES);
+  if(tooBig.length) toast(tooBig.map(f=>f.name).join(', ')+' exceeded '+fmtBytes(MAX_DOC_BYTES)+' and was not attached','warn');
+  if(!ok.length){ input.value=''; return; }
+  Promise.all(ok.map(f=>readFileAsDataUrl(f).then(url=>{
+    const id='doc-'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+    return saveDocPayload(id,url).then(()=>({id,name:f.name,size:f.size,type:f.type||'',note:note.trim()}));
+  })))
+  .then(metas=>{
+    wiz.data.docs.push(...metas);
+    input.value='';
+    renderNewRequest();
+    toast(metas.length===1?metas[0].name+' attached':metas.length+' files attached','ok');
+  })
+  .catch(()=>{ input.value=''; toast('Could not read that file. Try a different one.','err'); });
 }
 function wizNext(){
   wizCapture();
@@ -2242,7 +2314,7 @@ function updateLoanCalc(){
     loCompMode:mode, loCompPct:mode==='pct'?compVal:0, loCompBps:mode==='bps'?compVal:0});
   const bal=postedBalance(myBranch());
 
-  const latest=S.policies.slice().sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom))[0];
+  const latest=policiesVisibleHere().slice().sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom))[0];
   const stale=(latest&&latest.version!==pol.version)
     ? `<div class="calc-line" style="color:var(--gold-dark,#9a6a00)"><span>Dated ${fmtDate(date)}, so it prices under ${pol.version}</span><span>${latest.version} (${latest.marginThresholdBps} bps) starts ${fmtDate(latest.effectiveFrom)}</span></div>` : '';
   const ruleFields=`
@@ -2645,7 +2717,7 @@ function generateRecurring(){
    ADMINISTRATION
    ===================================================================== */
 function renderAdmin(){
-  const pol=[...S.policies].sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom));
+  const pol=[...policiesVisibleHere()].sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom));
   const cur=policyFor(today());
   document.getElementById('v-admin').innerHTML=`
   <div class="grid-2col" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px">
@@ -2672,21 +2744,30 @@ function renderAdmin(){
     </div>`:''}
     <div class="card">
       <h3 style="margin:0 0 6px">Overage policy rules</h3>
-      <p class="muted" style="margin:0 0 12px;font-size:.86rem">Effective-dated. New versions apply prospectively; every posted loan keeps the snapshot of the rule that priced it, so history never recalculates.</p>
+      <p class="muted" style="margin:0 0 10px;font-size:.86rem">Effective-dated and scoped per branch. A rule published for one branch never changes another. Every posted loan keeps the snapshot of the rule that priced it, so history never recalculates.</p>
+      <div class="calc-box" style="margin-bottom:12px"><div class="calc-line"><span>In effect for <b>${esc(prBranch().name)}</b> today</span><span><b>${cur.version}</b> \u00b7 ${cur.marginThresholdBps} bps \u00b7 ${esc(policyScopeLabel(cur))}</span></div></div>
       <table class="tbl">
-        <thead><tr><th>Version</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Branch net (LP)</th><th class="num">Corp take (LP)</th><th class="num">Branch / corp (BP)</th><th class="num">Proc. baseline</th><th></th></tr></thead>
+        <thead><tr><th>Version</th><th>Applies to</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Branch net (LP)</th><th class="num">Corp take (LP)</th><th class="num">Branch / corp (BP)</th><th class="num">Proc. baseline</th><th></th></tr></thead>
         <tbody>${pol.map(p=>`<tr>
-          <td style="font-weight:700">${p.version}</td><td>${fmtDate(p.effectiveFrom)}</td>
+          <td style="font-weight:700">${p.version}</td>
+          <td>${p.branch?`<span class="chip c-teal">${esc(policyScopeLabel(p))}</span>`:'<span class="chip c-gray">All branches</span>'}</td>
+          <td>${fmtDate(p.effectiveFrom)}</td>
           <td class="num">${p.marginThresholdBps} bps</td>
           <td class="num">${branchNetBpsOf(p)===null?'\u2014':branchNetBpsOf(p)+' bps'}</td>
           <td class="num">${corpTakeBpsOf(p)===null?'\u2014':corpTakeBpsOf(p)+' bps'}</td>
           <td class="num">${usesWaterfall(p)?branchTakePctOf(p)+'% / '+corpTakePctOf(p)+'%':'\u2014'}</td>
           <td class="num">${fmt$(p.procBaselineCents)}</td>
-          <td>${p.version===cur.version?'<span class="chip c-teal">In effect</span>':'<span class="muted" style="font-size:.76rem">'+(usesWaterfall(p)?'':'legacy')+'</span>'}</td></tr>`).join('')}
+          <td>${(p.id||p.version)===(cur.id||cur.version)?'<span class="chip c-teal">In effect here</span>':'<span class="muted" style="font-size:.76rem">'+(usesWaterfall(p)?'':'legacy')+'</span>'}</td></tr>`).join('')}
         </tbody>
       </table>
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:16px">
         <div style="font-weight:700;font-size:.9rem;margin-bottom:10px">Publish new policy version</div>
+        <div class="fld" style="margin-bottom:12px"><label>Applies to</label>
+          <select id="polScope">
+            <option value="${esc(myBranch())}" selected>${esc(prBranch().name)} only</option>
+            <option value="">All branches (company default)</option>
+          </select>
+          <div class="hint">Defaults to the branch you are viewing. Publishing here does not change any other branch.</div></div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px">
           <div class="fld"><label>Effective from</label><input id="polFrom" type="date" value="${today().slice(0,8)}01">
             <div class="hint">Prices loans <b>funded on or after</b> this date. Defaults to the 1st of this month so loans already funded this month are covered. Back-date it further if you need to reprice earlier months.</div></div>
@@ -2901,15 +2982,18 @@ function addPolicy(){
   const base=toCents(document.getElementById('polBase').value);
   const take=parseFloat(document.getElementById('polTake').value);
   const net=parseFloat(document.getElementById('polNet').value);
+  const scope=document.getElementById('polScope').value||null;
+  const scopeName=scope?((S.branches.find(b=>b.id===scope)||{}).name||scope):'all branches';
   if(!from||isNaN(bps)||base===null){ toast('Effective date, threshold, and baseline are required','warn'); return; }
   if(isNaN(net)){ toast('Enter the branch net at threshold, in basis points','warn'); return; }
-  const v='R'+(S.policies.length+1);
-  confirmModal('Publish policy '+v+'?','From '+fmtDate(from)+', loans funded on or after that date price at a '+bps+' bps threshold. Lender paid: corp takes '+(Math.round((bps-net)*10)/10)+' bps, branch nets '+net+' bps at threshold. Borrower paid: branch '+(isNaN(take)?73:take)+'%, corp '+(Math.round((100-(isNaN(take)?73:take))*100)/100)+'%. Processing baseline '+fmt$(base)+'. Loans already posted keep their original rule snapshot.','Publish',()=>{
-    S.policies.push({version:v,effectiveFrom:from,marginThresholdBps:bps,procBaselineCents:base,
+  const v='R'+(S.policies.filter(p=>p.branch===scope).length+1)+(scope?' \u00b7 '+scopeName:'');
+  confirmModal('Publish for '+scopeName+'?','Applies to '+scopeName+' only. From '+fmtDate(from)+', loans funded on or after that date price at a '+bps+' bps threshold. Lender paid: corp takes '+(Math.round((bps-net)*10)/10)+' bps, branch nets '+net+' bps at threshold. Borrower paid: branch '+(isNaN(take)?73:take)+'%, corp '+(Math.round((100-(isNaN(take)?73:take))*100)/100)+'%. Processing baseline '+fmt$(base)+'. Loans already posted keep their original rule snapshot.','Publish',()=>{
+    S.policies.push({id:uid('pol'), branch:scope, version:v, effectiveFrom:from,
+      marginThresholdBps:bps, procBaselineCents:base,
       branchNetBps:net, branchTakePct:isNaN(take)?73:take, note:'Published by '+me.name});
-    logAudit('admin','Published policy '+v+' \u00b7 threshold '+bps+' bps \u00b7 branch net '+net+' bps \u00b7 branch '+(isNaN(take)?73:take)+'% borrower paid \u00b7 baseline '+fmt$(base)+' \u00b7 effective '+fmtDate(from),null);
+    logAudit('admin','Published policy '+v+' \u00b7 scope '+scopeName+' \u00b7 threshold '+bps+' bps \u00b7 branch net '+net+' bps \u00b7 branch '+(isNaN(take)?73:take)+'% borrower paid \u00b7 baseline '+fmt$(base)+' \u00b7 effective '+fmtDate(from),null);
     save(); renderAdmin();
-    toast('Policy '+v+' published. It prices loans funded on or after '+fmtDate(from)+'; earlier loans keep their original rule.','ok');
+    toast('Published for '+scopeName+'. Loans funded on or after '+fmtDate(from)+' price under it; other branches are unchanged.','ok');
   });
 }
 
