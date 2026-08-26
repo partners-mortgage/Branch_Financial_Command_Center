@@ -910,6 +910,7 @@ function migrateUsers(){
       changed=true; notes.push('merged duplicate account for '+e);
     });
   });
+  if(migrateTiers()) changed=true;
   if(changed){ logAudit('access','Account records healed \u00b7 '+(notes.join('; ')||'schema updated'),null); save(); }
   return changed;
 }
@@ -1831,11 +1832,33 @@ function reqChip(st){
 function tierFor(amountCents){
   return S.approvalTiers.find(t=>t.maxCents===null||amountCents<=t.maxCents);
 }
-function canApprove(r){
-  if(r.createdBy===me.id) return false; /* separation of duties */
-  const tier=tierFor(r.amountCents);
-  return tier.approvers.includes(me.role);
+const CANON_TIERS=[
+  {maxCents:100000, approvers:['finance','approver','admin'], label:'Up to $1,000: Finance Operations, Approver, or Administrator'},
+  {maxCents:null,   approvers:['approver','admin'], label:'Over $1,000: Approver or Administrator'}
+];
+/* Approval routing is configuration, so it follows the code rather than whatever an
+   older version happened to save. Without this, tiers written by an earlier release
+   keep excluding roles that did not exist yet. */
+function migrateTiers(){
+  const cur=JSON.stringify((S.approvalTiers||[]).map(t=>({m:t.maxCents,a:(t.approvers||[]).slice().sort()})));
+  const want=JSON.stringify(CANON_TIERS.map(t=>({m:t.maxCents,a:t.approvers.slice().sort()})));
+  if(cur===want) return false;
+  S.approvalTiers=JSON.parse(JSON.stringify(CANON_TIERS));
+  logAudit('admin','Approval routing updated to current policy',null);
+  return true;
 }
+/* Returns null when the person may approve, otherwise a plain-English reason. */
+function approvalBlockReason(r){
+  if(r.createdBy===me.id) return 'You created this request. Someone else has to approve it so the same person never both requests and releases funds.';
+  if(me.role==='admin') return null;   /* an administrator is never locked out by routing */
+  const tier=tierFor(r.amountCents);
+  if(!tier.approvers.includes(me.role)){
+    const who=tier.approvers.map(x=>ROLE_LABEL[x]||x).join(', ');
+    return 'Requests of this size need '+who+'. Your role is '+(ROLE_LABEL[me.role]||me.role)+'.';
+  }
+  return null;
+}
+function canApprove(r){ return approvalBlockReason(r)===null; }
 let reqFilter='all';
 function renderRequests(){
   if(drill.status==='open') reqFilter='open';
@@ -1890,7 +1913,11 @@ function openReq(id){
   if(['Approved','Scheduled'].includes(r.status)&&me.role!=='manager') actions+=act('Mark paid \u00b7 post debit','btn-primary',`markPaid('${r.id}')`);
   if(OPEN_REQ.concat(['Approved','Scheduled']).includes(r.status)&&(isRequester||me.role==='admin')) actions+=act('Cancel','btn-quiet',`reqAction('${r.id}','Cancelled')`);
   if(r.status==='Paid'&&me.role!=='manager') actions+=act('Reverse payment','btn-danger',`reversePaid('${r.id}')`);
-  if(['Submitted','Under Review'].includes(r.status)&&isRequester&&!mayApprove) actions+=`<span class="locked-note">Separation of duties: you cannot approve your own request</span>`;
+  if(['Submitted','Under Review','Needs Information'].includes(r.status)&&!mayApprove){
+    const why=approvalBlockReason(r);
+    const eligible=S.users.filter(u=>u.id!==r.createdBy&&(u.role==='admin'||tier.approvers.includes(u.role)));
+    actions+=`<div class="locked-note" style="display:block;line-height:1.5">${esc(why||'')}${eligible.length?' Who can: '+esc(eligible.map(u=>u.name).join(', '))+'.':' <b>No one else can approve this yet.</b> Add an Approver or Administrator under Administration.'}</div>`;
+  }
 
   document.getElementById('reqDrawerTitle').textContent=r.id;
   document.getElementById('reqDrawerBody').innerHTML=`
@@ -1958,7 +1985,7 @@ function reqAction(id,newStatus){
   const r=S.requests.find(x=>x.id===id);
   const needsReason=['Rejected','Cancelled','Needs Information'].includes(newStatus);
   const doIt=(note)=>{
-    if(['Approved','Under Review'].includes(newStatus)&&!canApprove(r)&&me.role!=='admin'){ toast('You are not an authorized approver for this request','err'); return true; }
+    if(['Approved','Under Review'].includes(newStatus)&&!canApprove(r)){ toast(approvalBlockReason(r)||'You are not an authorized approver for this request','err'); return true; }
     const prev=r.status; r.status=newStatus;
     r.timeline.push({at:nowISO(),who:me.name,action:statusVerb(newStatus),note:note||null,delta:'Status: '+prev+' \u2192 '+newStatus});
     logAudit('request',r.id+' '+prev+' \u2192 '+newStatus+' by '+me.name,{note:note||null});
