@@ -540,7 +540,9 @@ function branchNetBpsOf(pol){ return (pol.branchNetBps===undefined||pol.branchNe
 function corpTakeBpsOf(pol){ const bn=branchNetBpsOf(pol); return bn===null?null:Math.round((pol.marginThresholdBps-bn)*10)/10; }
 /* A rule uses the full waterfall once a branch net (bps) is defined on it.
    The original R1 rule has none, so every historical loan keeps the old math. */
-function usesWaterfall(pol){ return branchNetBpsOf(pol)!==null; }
+function policyModel(pol){ return pol.model || (branchNetBpsOf(pol)!==null?'waterfall':'overage'); }
+function usesWaterfall(pol){ return policyModel(pol)==='waterfall'; }
+const MODEL_LABEL={overage:'Overage above threshold', waterfall:'Full margin waterfall'};
 
 function calcLoan(loanAmountCents, actualBps, procFeeCents, pol, o){
   o=o||{};
@@ -549,12 +551,12 @@ function calcLoan(loanAmountCents, actualBps, procFeeCents, pol, o){
   const base={overageBps, procOverageCents, thresholdBps:pol.marginThresholdBps,
     procBaselineCents:pol.procBaselineCents, ruleVersion:pol.version};
 
-  /* Legacy rule (no branch net defined, e.g. R1): the branch simply keeps margin
-     above the threshold. This is what the original spreadsheet did and it is how
-     every historical loan stays priced. */
-  if(!usesWaterfall(pol) && o.originator!=='lo'){
+  /* OVERAGE MODEL. The branch banks whatever margin lands above the threshold, and
+     nothing below it. Compensation at or under the threshold is settled outside this
+     ledger, so a thin deal credits $0 and can never create a deficit. */
+  if(!usesWaterfall(pol)){
     const marginOverageCents=bpsMul(loanAmountCents,overageBps);
-    return {...base, originator:'manager',
+    return {...base, model:'overage', originator:(o.originator==='lo'?'lo':'manager'), loName:o.loName||null,
       marginOverageCents, netCents:marginOverageCents+procOverageCents};
   }
 
@@ -587,7 +589,7 @@ function calcLoan(loanAmountCents, actualBps, procFeeCents, pol, o){
   const loCompCents=lenderPaid?bpsMul(loanAmountCents, loCompBps)
                               :pctMul(totalMarginCents, loCompPct);
   const marginOverageCents=branchShareCents-loCompCents;
-  return {...base, originator:(o.originator==='lo'?'lo':'manager'), loName:o.loName||null,
+  return {...base, model:'waterfall', originator:(o.originator==='lo'?'lo':'manager'), loName:o.loName||null,
     compBasis:lenderPaid?'lender-paid':'borrower-paid',
     totalMarginCents, branchTakePct:takePct, corpTakePct, branchNetBps:bNetBps, corpTakeBps:cTakeBps,
     corpTakeCents, corpBasis, branchShareCents,
@@ -2315,8 +2317,8 @@ function updateLoanCalc(){
   const bps=parseFloat(g('le-bps').value)||0;
   const fee=toCents(g('le-fee').value)||0;
   const isLO=g('le-orig').value==='lo';
-  const waterfall=usesWaterfall(pol)||isLO;
-  g('le-lo-wrap').style.display=waterfall?'block':'none';
+  const waterfall=usesWaterfall(pol);
+  g('le-lo-wrap').style.display='block';
   g('le-comp-wrap').style.display=waterfall?'flex':'none';
   g('le-lolabel').textContent=isLO?'Loan officer':'Branch manager (originator)';
   if(!isLO&&!g('le-lo').value.trim()){
@@ -2360,9 +2362,11 @@ function updateLoanCalc(){
     <div class="calc-line"><span>Net margin to branch P&amp;L</span><span><b>${fmt$s(c.marginOverageCents)}</b></span></div>
     <div class="calc-line" style="margin-top:8px"><span>Processing overage $</span><span><b>${fmt$(c.procOverageCents)}</b></span></div>`;
   }else{
+    const under=bps&&bps<pol.marginThresholdBps;
     body=`
-    <div class="calc-line"><span>Margin overage bps</span><span><b>${c.overageBps}</b></span></div>
-    <div class="calc-line"><span>Margin overage $</span><span><b>${fmt$(c.marginOverageCents)}</b></span></div>
+    <div class="calc-line"><span>Margin over ${pol.marginThresholdBps} bps</span><span><b>${c.overageBps} bps</b></span></div>
+    <div class="calc-line"><span>Banks to the branch</span><span><b>${fmt$(c.marginOverageCents)}</b></span></div>
+    ${under?`<div class="calc-line" style="color:var(--gray)"><span>Below the threshold, so nothing banks</span><span>no deficit is created</span></div>`:''}
     <div class="calc-line"><span>Processing overage $</span><span><b>${fmt$(c.procOverageCents)}</b></span></div>`;
   }
   const warn = (waterfall&&c.netCents<0)
@@ -2382,15 +2386,18 @@ function postLoanEntry(){
   const loName=g('le-lo').value.trim();
   const mode=g('le-compmode').value;
   const compVal=parseFloat(g('le-compval').value);
-  const waterfall=usesWaterfall(policyFor(date))||isLO;
+  const waterfall=usesWaterfall(policyFor(date));
   const who=isLO?'loan officer':'branch manager';
   if(waterfall&&!loName){ toast('Enter the '+who+' name','warn'); return; }
+  if(!waterfall&&!loName){ toast('Enter the '+who+' name','warn'); return; }
   if(waterfall&&(isNaN(compVal)||compVal<0)){ toast('Enter the '+who+' compensation'+(mode==='pct'?' as a percent of margin':' in basis points')+'. Enter 0 if none is paid.','warn'); return; }
-  const opts=waterfall?{originator:isLO?'lo':'manager',loName,loCompMode:mode,loCompPct:mode==='pct'?compVal:0,loCompBps:mode==='bps'?compVal:0}:{originator:'manager'};
+  const opts=waterfall
+    ?{originator:isLO?'lo':'manager',loName,loCompMode:mode,loCompPct:mode==='pct'?compVal:0,loCompBps:mode==='bps'?compVal:0}
+    :{originator:isLO?'lo':'manager',loName};
   const doPost=(overrideNote)=>{
     const pol=policyFor(date); const c=calcLoan(amt,bps,fee,pol,opts);
     const t=postTxn({branch:myBranch(),type:'loan',date,
-      desc:'Funded loan \u00b7 '+borrower+' \u00b7 #'+ln+(waterfall?' \u00b7 '+(isLO?'LO ':'BM ')+loName:''),
+      desc:'Funded loan \u00b7 '+borrower+' \u00b7 #'+ln+(loName?' \u00b7 '+(isLO?'LO ':'BM ')+loName:''),
       amountCents:c.netCents,createdBy:me.id,
       detail:{borrower,loanNumber:ln,loanAmountCents:amt,actualBps:bps,procFeeCents:fee,...c,override:overrideNote||null}});
     save(); sessionPosts.unshift(t.id);
@@ -2774,21 +2781,29 @@ function renderAdmin(){
       <p class="muted" style="margin:0 0 10px;font-size:.86rem">Effective-dated and scoped per branch. A rule published for one branch never changes another. Every posted loan keeps the snapshot of the rule that priced it, so history never recalculates.</p>
       <div class="calc-box" style="margin-bottom:12px"><div class="calc-line"><span>In effect for <b>${esc(prBranch().name)}</b> today</span><span><b>${cur.version}</b> \u00b7 ${cur.marginThresholdBps} bps \u00b7 ${esc(policyScopeLabel(cur))}</span></div></div>
       <table class="tbl">
-        <thead><tr><th>Version</th><th>Applies to</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Branch net (LP)</th><th class="num">Corp take (LP)</th><th class="num">Branch / corp (BP)</th><th class="num">Proc. baseline</th><th></th></tr></thead>
+        <thead><tr><th>Version</th><th>Applies to</th><th>Model</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Branch net (LP)</th><th class="num">Corp take (LP)</th><th class="num">Branch / corp (BP)</th><th class="num">Proc. baseline</th><th></th></tr></thead>
         <tbody>${pol.map(p=>`<tr>
           <td style="font-weight:700">${p.version}</td>
           <td>${p.branch?`<span class="chip c-teal">${esc(policyScopeLabel(p))}</span>`:'<span class="chip c-gray">All branches</span>'}</td>
+          <td><span class="chip ${usesWaterfall(p)?'c-teal':'c-gray'}">${MODEL_LABEL[policyModel(p)]}</span></td>
           <td>${fmtDate(p.effectiveFrom)}</td>
           <td class="num">${p.marginThresholdBps} bps</td>
           <td class="num">${branchNetBpsOf(p)===null?'\u2014':branchNetBpsOf(p)+' bps'}</td>
           <td class="num">${corpTakeBpsOf(p)===null?'\u2014':corpTakeBpsOf(p)+' bps'}</td>
           <td class="num">${usesWaterfall(p)?branchTakePctOf(p)+'% / '+corpTakePctOf(p)+'%':'\u2014'}</td>
           <td class="num">${fmt$(p.procBaselineCents)}</td>
-          <td>${(p.id||p.version)===(cur.id||cur.version)?'<span class="chip c-teal">In effect here</span>':'<span class="muted" style="font-size:.76rem">'+(usesWaterfall(p)?'':'legacy')+'</span>'}</td></tr>`).join('')}
+          <td>${(p.id||p.version)===(cur.id||cur.version)?'<span class="chip c-teal">In effect here</span>':''}
+            ${policyUseCount(p)===0?`<button class="btn btn-quiet btn-sm" onclick="deletePolicy('${esc(p.id||p.version)}')">Delete</button>`:`<span class="muted" style="font-size:.74rem">priced ${policyUseCount(p)} loan(s)</span>`}</td></tr>`).join('')}
         </tbody>
       </table>
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:16px">
         <div style="font-weight:700;font-size:.9rem;margin-bottom:10px">Publish new policy version</div>
+        <div class="fld" style="margin-bottom:12px"><label>Pricing model</label>
+          <select id="polModel" onchange="polPreview()">
+            <option value="overage">Overage above threshold</option>
+            <option value="waterfall">Full margin waterfall</option>
+          </select>
+          <div class="hint" id="polModelHint"></div></div>
         <div class="fld" style="margin-bottom:12px"><label>Applies to</label>
           <select id="polScope">
             <option value="${esc(myBranch())}" selected>${esc(prBranch().name)} only</option>
@@ -2799,9 +2814,9 @@ function renderAdmin(){
           <div class="fld"><label>Effective from</label><input id="polFrom" type="date" value="${today().slice(0,8)}01">
             <div class="hint">Prices loans <b>funded on or after</b> this date. Defaults to the 1st of this month so loans already funded this month are covered. Back-date it further if you need to reprice earlier months.</div></div>
           <div class="fld"><label>Margin threshold (bps)</label><input id="polBps" type="number" step="0.1" value="${cur.marginThresholdBps}"><div class="hint">At or above this, deals are lender paid (bps). Below it, borrower paid (percent).</div></div>
-          <div class="fld"><label>Branch net at threshold (bps)</label><input id="polNet" type="number" step="0.1" value="${branchNetBpsOf(cur)===null?225:branchNetBpsOf(cur)}" oninput="polPreview()"><div class="hint" id="polNetHint"></div></div>
+          <div class="fld" id="polNetWrap"><label>Branch net at threshold (bps)</label><input id="polNet" type="number" step="0.1" value="${branchNetBpsOf(cur)===null?225:branchNetBpsOf(cur)}" oninput="polPreview()"><div class="hint" id="polNetHint"></div></div>
           <div class="fld"><label>Processing baseline ($)</label><input id="polBase" type="number" step="0.01" value="${(cur.procBaselineCents/100).toFixed(2)}"></div>
-          <div class="fld"><label>Branch take, borrower paid (%)</label><input id="polTake" type="number" step="0.01" value="${branchTakePctOf(cur)}" oninput="polPreview()"><div class="hint" id="polTakeHint"></div></div>
+          <div class="fld" id="polTakeWrap"><label>Branch take, borrower paid (%)</label><input id="polTake" type="number" step="0.01" value="${branchTakePctOf(cur)}" oninput="polPreview()"><div class="hint" id="polTakeHint"></div></div>
         </div>
         <div class="calc-box" style="margin-top:12px"><div class="kpi-label" style="margin-bottom:6px">The equation this publishes</div>
           <div class="calc-line"><span>Total margin \u2212 corp take \u2212 LO comp</span><span><b>= net to branch P&amp;L</b></span></div>
@@ -2997,27 +3012,56 @@ function resetToCutover(){
 function polPreview(){
   const g=id=>document.getElementById(id); if(!g('polBps')) return;
   const thr=parseFloat(g('polBps').value)||0, net=parseFloat(g('polNet').value)||0, take=parseFloat(g('polTake').value)||0;
-  const corpBps=Math.round((thr-net)*10)/10, corpPct=Math.round((100-take)*100)/100;
-  g('polNetHint').innerHTML='Implies a corp take of <b>'+corpBps+' bps</b> on lender-paid deals';
-  g('polTakeHint').innerHTML='Implies a corp take of <b>'+corpPct+'%</b> of margin on borrower-paid deals';
-  g('polPrevLP').innerHTML='<span>Lender paid (at or above '+thr+' bps)</span><span>corp '+corpBps+' bps \u00b7 branch nets '+net+' bps at threshold</span>';
-  g('polPrevBP').innerHTML='<span>Borrower paid (below '+thr+' bps)</span><span>corp '+corpPct+'% \u00b7 branch '+take+'% of margin</span>';
+  const model=g('polModel').value;
+  const wf=model==='waterfall';
+  g('polNetWrap').style.display=wf?'block':'none';
+  g('polTakeWrap').style.display=wf?'block':'none';
+  g('polModelHint').innerHTML = wf
+    ? 'The branch participates in the full margin: total margin less corp take less originator comp.'
+    : 'The branch banks only margin <b>above</b> the threshold. Compensation at or below the threshold is settled outside this ledger, so a thin deal credits $0 and never creates a deficit.';
+  if(wf){
+    const corpBps=Math.round((thr-net)*10)/10, corpPct=Math.round((100-take)*100)/100;
+    g('polNetHint').innerHTML='Implies a corp take of <b>'+corpBps+' bps</b> on lender-paid deals';
+    g('polTakeHint').innerHTML='Implies a corp take of <b>'+corpPct+'%</b> of margin on borrower-paid deals';
+    g('polPrevLP').innerHTML='<span>Lender paid (at or above '+thr+' bps)</span><span>corp '+corpBps+' bps \u00b7 branch nets '+net+' bps at threshold</span>';
+    g('polPrevBP').innerHTML='<span>Borrower paid (below '+thr+' bps)</span><span>corp '+corpPct+'% \u00b7 branch '+take+'% of margin</span>';
+  }else{
+    g('polPrevLP').innerHTML='<span>At or above '+thr+' bps</span><span>the amount over '+thr+' banks to the branch</span>';
+    g('polPrevBP').innerHTML='<span>Below '+thr+' bps</span><span>credits $0 \u00b7 never a deficit</span>';
+  }
+}
+function policyUseCount(p){
+  const key=p.version;
+  return S.transactions.filter(t=>t.type==='loan'&&t.detail&&t.detail.ruleVersion===key&&!t.reverses).length;
+}
+function deletePolicy(id){
+  const p=S.policies.find(x=>(x.id||x.version)===id); if(!p) return;
+  if(S.policies.length<=1){ toast('At least one rule has to remain','warn'); return; }
+  const used=policyUseCount(p);
+  if(used>0){ toast('That rule priced '+used+' posted loan(s), so it cannot be deleted. Publish a newer rule to supersede it.','warn'); return; }
+  confirmModal('Delete '+p.version+'?','It has never priced a posted loan, so nothing recalculates. This removes it from '+policyScopeLabel(p)+'.','Delete',()=>{
+    S.policies=S.policies.filter(x=>(x.id||x.version)!==id);
+    logAudit('admin','Policy deleted \u00b7 '+p.version+' \u00b7 '+policyScopeLabel(p)+' \u00b7 never used',null);
+    save(); renderAdmin(); toast(p.version+' deleted','ok');
+  });
 }
 function addPolicy(){
   const from=document.getElementById('polFrom').value;
   const bps=parseFloat(document.getElementById('polBps').value);
   const base=toCents(document.getElementById('polBase').value);
   const take=parseFloat(document.getElementById('polTake').value);
+  const model=document.getElementById('polModel').value;
   const net=parseFloat(document.getElementById('polNet').value);
   const scope=document.getElementById('polScope').value||null;
   const scopeName=scope?((S.branches.find(b=>b.id===scope)||{}).name||scope):'all branches';
   if(!from||isNaN(bps)||base===null){ toast('Effective date, threshold, and baseline are required','warn'); return; }
-  if(isNaN(net)){ toast('Enter the branch net at threshold, in basis points','warn'); return; }
+  if(model==='waterfall'&&isNaN(net)){ toast('Enter the branch net at threshold, in basis points','warn'); return; }
   const v='R'+(S.policies.filter(p=>p.branch===scope).length+1)+(scope?' \u00b7 '+scopeName:'');
   confirmModal('Publish for '+scopeName+'?','Applies to '+scopeName+' only. From '+fmtDate(from)+', loans funded on or after that date price at a '+bps+' bps threshold. Lender paid: corp takes '+(Math.round((bps-net)*10)/10)+' bps, branch nets '+net+' bps at threshold. Borrower paid: branch '+(isNaN(take)?73:take)+'%, corp '+(Math.round((100-(isNaN(take)?73:take))*100)/100)+'%. Processing baseline '+fmt$(base)+'. Loans already posted keep their original rule snapshot.','Publish',()=>{
-    S.policies.push({id:uid('pol'), branch:scope, version:v, effectiveFrom:from,
+    S.policies.push({id:uid('pol'), branch:scope, version:v, effectiveFrom:from, model,
       marginThresholdBps:bps, procBaselineCents:base,
-      branchNetBps:net, branchTakePct:isNaN(take)?73:take, note:'Published by '+me.name});
+      branchNetBps:(model==='waterfall'?net:null), branchTakePct:(model==='waterfall'?(isNaN(take)?73:take):null),
+      note:'Published by '+me.name});
     logAudit('admin','Published policy '+v+' \u00b7 scope '+scopeName+' \u00b7 threshold '+bps+' bps \u00b7 branch net '+net+' bps \u00b7 branch '+(isNaN(take)?73:take)+'% borrower paid \u00b7 baseline '+fmt$(base)+' \u00b7 effective '+fmtDate(from),null);
     save(); renderAdmin();
     toast('Published for '+scopeName+'. Loans funded on or after '+fmtDate(from)+' price under it; other branches are unchanged.','ok');
