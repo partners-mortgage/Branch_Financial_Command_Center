@@ -2776,11 +2776,12 @@ function renderAdmin(){
       </div>
       <div style="margin-top:14px"><button class="btn btn-primary" onclick="addBranch()">Create branch</button></div>
     </div>`:''}
-    <div class="card">
+    <div class="card" style="grid-column:1/-1">
       <h3 style="margin:0 0 6px">Overage policy rules</h3>
       <p class="muted" style="margin:0 0 10px;font-size:.86rem">Effective-dated and scoped per branch. A rule published for one branch never changes another. Every posted loan keeps the snapshot of the rule that priced it, so history never recalculates.</p>
       <div class="calc-box" style="margin-bottom:12px"><div class="calc-line"><span>In effect for <b>${esc(prBranch().name)}</b> today</span><span><b>${cur.version}</b> \u00b7 ${cur.marginThresholdBps} bps \u00b7 ${esc(policyScopeLabel(cur))}</span></div></div>
-      <table class="tbl">
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">
+      <table class="tbl" style="min-width:880px">
         <thead><tr><th>Version</th><th>Applies to</th><th>Model</th><th>Effective</th><th class="num">Margin threshold</th><th class="num">Branch net (LP)</th><th class="num">Corp take (LP)</th><th class="num">Branch / corp (BP)</th><th class="num">Proc. baseline</th><th></th></tr></thead>
         <tbody>${pol.map(p=>`<tr>
           <td style="font-weight:700">${p.version}</td>
@@ -2796,6 +2797,7 @@ function renderAdmin(){
             ${policyUseCount(p)===0?`<button class="btn btn-quiet btn-sm" onclick="deletePolicy('${esc(p.id||p.version)}')">Delete</button>`:`<span class="muted" style="font-size:.74rem">priced ${policyUseCount(p)} loan(s)</span>`}</td></tr>`).join('')}
         </tbody>
       </table>
+      </div>
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:16px">
         <div style="font-weight:700;font-size:.9rem;margin-bottom:10px">Publish new policy version</div>
         <div class="fld" style="margin-bottom:12px"><label>Pricing model</label>
@@ -2811,21 +2813,21 @@ function renderAdmin(){
           </select>
           <div class="hint">Defaults to the branch you are viewing. Publishing here does not change any other branch.</div></div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px">
-          <div class="fld"><label>Effective from</label><input id="polFrom" type="date" value="${today().slice(0,8)}01">
+          <div class="fld"><label>Effective from</label><input id="polFrom" type="date" value="${today().slice(0,8)}01" onchange="polPreview()">
             <div class="hint">Prices loans <b>funded on or after</b> this date. Defaults to the 1st of this month so loans already funded this month are covered. Back-date it further if you need to reprice earlier months.</div></div>
-          <div class="fld"><label>Margin threshold (bps)</label><input id="polBps" type="number" step="0.1" value="${cur.marginThresholdBps}"><div class="hint">At or above this, deals are lender paid (bps). Below it, borrower paid (percent).</div></div>
+          <div class="fld"><label>Margin threshold (bps)</label><input id="polBps" type="number" step="0.1" value="${cur.marginThresholdBps}" oninput="polPreview()"><div class="hint">At or above this, deals are lender paid (bps). Below it, borrower paid (percent).</div></div>
           <div class="fld" id="polNetWrap"><label>Branch net at threshold (bps)</label><input id="polNet" type="number" step="0.1" value="${branchNetBpsOf(cur)===null?225:branchNetBpsOf(cur)}" oninput="polPreview()"><div class="hint" id="polNetHint"></div></div>
-          <div class="fld"><label>Processing baseline ($)</label><input id="polBase" type="number" step="0.01" value="${(cur.procBaselineCents/100).toFixed(2)}"></div>
+          <div class="fld"><label>Processing baseline ($)</label><input id="polBase" type="number" step="0.01" value="${(cur.procBaselineCents/100).toFixed(2)}" oninput="polPreview()"></div>
           <div class="fld" id="polTakeWrap"><label>Branch take, borrower paid (%)</label><input id="polTake" type="number" step="0.01" value="${branchTakePctOf(cur)}" oninput="polPreview()"><div class="hint" id="polTakeHint"></div></div>
         </div>
-        <div class="calc-box" style="margin-top:12px"><div class="kpi-label" style="margin-bottom:6px">The equation this publishes</div>
-          <div class="calc-line"><span>Total margin \u2212 corp take \u2212 LO comp</span><span><b>= net to branch P&amp;L</b></span></div>
+        <div class="calc-box" style="margin-top:12px"><div class="kpi-label" style="margin-bottom:6px">Preview of what this publishes</div>
+          <div class="calc-line" id="polPrevHdr"></div>
           <div class="calc-line" id="polPrevLP"></div>
           <div class="calc-line" id="polPrevBP"></div></div>
         <div style="margin-top:12px"><button class="btn btn-primary btn-sm" onclick="addPolicy()">Publish version</button></div>
       </div>
     </div>
-    <div class="card">
+    <div class="card" style="grid-column:1/-1">
       <h3 style="margin:0 0 12px">Approval routing</h3>
       ${S.approvalTiers.map(t=>`<div class="check-row"><div class="cico" style="background:var(--teal-soft);color:var(--teal)">\u2713</div>
         <div><div class="ct">${esc(t.label)}</div><div class="cd">Separation of duties enforced: a requester can never approve their own request.</div></div></div>`).join('')}
@@ -3019,11 +3021,16 @@ function polPreview(){
   g('polModelHint').innerHTML = wf
     ? 'The branch participates in the full margin: total margin less corp take less originator comp.'
     : 'The branch banks only margin <b>above</b> the threshold. Compensation at or below the threshold is settled outside this ledger, so a thin deal credits $0 and never creates a deficit.';
+  const fromEl=g('polFrom'), baseEl=g('polBase');
+  const fromTxt=fromEl&&fromEl.value?fmtDate(fromEl.value):'\u2014';
+  const baseTxt=baseEl?fmt$(toCents(baseEl.value)||0):'';
+  const hdr=g('polPrevHdr');
+  if(hdr) hdr.innerHTML='<span>Publishing <b>'+MODEL_LABEL[model]+'</b> at <b>'+thr+' bps</b></span><span>from '+fromTxt+' \u00b7 baseline '+baseTxt+'</span>';
   if(wf){
     const corpBps=Math.round((thr-net)*10)/10, corpPct=Math.round((100-take)*100)/100;
     g('polNetHint').innerHTML='Implies a corp take of <b>'+corpBps+' bps</b> on lender-paid deals';
     g('polTakeHint').innerHTML='Implies a corp take of <b>'+corpPct+'%</b> of margin on borrower-paid deals';
-    g('polPrevLP').innerHTML='<span>Lender paid (at or above '+thr+' bps)</span><span>corp '+corpBps+' bps \u00b7 branch nets '+net+' bps at threshold</span>';
+    g('polPrevLP').innerHTML='<span>Lender paid, at or above '+thr+' bps</span><span>corp '+corpBps+' bps \u00b7 branch nets '+net+' bps at threshold</span>';
     g('polPrevBP').innerHTML='<span>Borrower paid (below '+thr+' bps)</span><span>corp '+corpPct+'% \u00b7 branch '+take+'% of margin</span>';
   }else{
     g('polPrevLP').innerHTML='<span>At or above '+thr+' bps</span><span>the amount over '+thr+' banks to the branch</span>';
